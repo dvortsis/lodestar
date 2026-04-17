@@ -733,8 +733,9 @@ FROM (
 ) t`;
       searchInnerSqlParamCount = sqlParams.length;
     } else {
-      // Raw string for PGroonga `&@~` (Query Syntax: `*`, OR/|, `-`, etc.). No extra outer quotes — bound as a single text param.
-      const groongaQuery = queryInput.keyword.trim();
+      // Raw string for PGroonga `&@~` (Query Syntax: `*`, OR, `-`, etc.). No extra outer quotes — bound as a single text param.
+      // Pipe is not boolean OR in PGroonga Query Syntax; normalize so alternation behaves as users expect from SQL tradition.
+      const groongaQuery = queryInput.keyword.trim().replace(/\|/g, " OR ");
       const keywordPh = p(groongaQuery, "text");
 
       matchedHashesSqlParamCount = sqlParams.length;

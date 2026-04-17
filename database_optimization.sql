@@ -1,22 +1,21 @@
 -- =============================================================================
--- BITMAGNET PERFORMANCE & SEARCH OPTIMIZATION SUITE (SIDECAR EDITION)
--- Target: PostgreSQL 14+
--- Components: PGroonga Sidecar, Materialized Stats, Custom Categorization
+-- LODESTAR / BITMAGNET PERFORMANCE & SEARCH OPTIMIZATION SUITE
+-- Target: PostgreSQL 14+ 
+-- Philosophy: PGroonga Bigram Indexing for Deep-File Discovery
 -- =============================================================================
 
 -- 1) Extensions
+-- PGroonga is the backbone of Lodestar's discovery engine.
 CREATE EXTENSION IF NOT EXISTS pgroonga;
--- We no longer use trigrams. You can drop the extension if no other apps use it.
--- DROP EXTENSION IF EXISTS pg_trgm CASCADE;
 
 -- 2) Core Schema Enhancements (Main Torrents Table)
--- Keep this table lightweight. NO heavy text blobs here.
+-- We add these columns to support the "Gold/Silver/Bronze" tiering and spam filtering.
 ALTER TABLE torrents
   ADD COLUMN IF NOT EXISTS file_stats jsonb NOT NULL DEFAULT '{}'::jsonb,
   ADD COLUMN IF NOT EXISTS is_spam boolean DEFAULT false,
   ADD COLUMN IF NOT EXISTS contained_extensions text[] DEFAULT '{}',
   ADD COLUMN IF NOT EXISTS max_seeders integer NOT NULL DEFAULT 0,
-  -- Custom Size Percentages (Based on our custom rules)
+  -- Custom Size Percentages for Advanced Filtering
   ADD COLUMN IF NOT EXISTS custom_video_pct numeric DEFAULT 0,
   ADD COLUMN IF NOT EXISTS custom_audio_pct numeric DEFAULT 0,
   ADD COLUMN IF NOT EXISTS custom_archive_pct numeric DEFAULT 0,
@@ -26,13 +25,15 @@ ALTER TABLE torrents
   ADD COLUMN IF NOT EXISTS custom_other_pct numeric DEFAULT 0;
 
 -- 3) The PGroonga Sidecar Engine
--- Isolates massive text data away from Bitmagnet's ORM crawler
+-- This table stores a flattened string of all file paths within a torrent.
+-- This allows "Gold Tier" searches (searching inside the torrent content).
 CREATE TABLE IF NOT EXISTS torrent_search_indexes (
     info_hash bytea PRIMARY KEY REFERENCES torrents(info_hash) ON DELETE CASCADE,
     search_text text
 );
 
--- 4) Generated Columns (Native Bitmagnet Composition - Count Based)
+-- 4) Generated Columns (Native Bitmagnet Composition)
+-- These provide quick percentages based on Bitmagnet's internal file counts.
 ALTER TABLE torrents 
   ADD COLUMN IF NOT EXISTS comp_video_count_pct numeric GENERATED ALWAYS AS ((COALESCE((file_stats->'video'->>'count')::numeric, 0) / NULLIF(files_count::numeric, 0) * 100.0)) STORED,
   ADD COLUMN IF NOT EXISTS comp_audio_count_pct numeric GENERATED ALWAYS AS ((COALESCE((file_stats->'audio'->>'count')::numeric, 0) / NULLIF(files_count::numeric, 0) * 100.0)) STORED,
@@ -57,70 +58,39 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql IMMUTABLE;
 
--- 6) Remove Dangerous Legacy Triggers
--- Real-time triggers cause write-locks and queue timeouts on massive multi-file torrents.
--- These metrics are now handled asynchronously by the external Janitor script.
+-- 6) Cleanup Legacy Bitmagnet Triggers
+-- Real-time stats calculation kills DB performance during mass crawls.
+-- Lodestar uses the 'janitor.js' script to handle this asynchronously.
 DROP TRIGGER IF EXISTS tr_sync_all_stats ON torrent_files;
 DROP FUNCTION IF EXISTS bm_sync_all_torrent_stats();
 
--- 7) Indexing Strategy
--- Drop legacy trigram indexes (reclaim SSD space)
+-- 7) Indexing Strategy (The Bigram Update)
+-- We use TokenBigram to ensure partial matches and the | (OR) operator work
+-- regardless of whether filenames use spaces, dots, or underscores.
+
+-- 7a) Drop legacy trigram indexes to save space.
 DROP INDEX IF EXISTS idx_torrents_name_trgm;
 DROP INDEX IF EXISTS idx_torrent_files_path_trgm;
 
--- Primary Search Index (PGroonga)
-CREATE INDEX IF NOT EXISTS ix_torrent_search_pgroonga ON torrent_search_indexes USING pgroonga (search_text);
+-- 7b) Primary Sidecar Search Index
+DROP INDEX IF EXISTS ix_torrent_search_pgroonga;
+CREATE INDEX ix_torrent_search_pgroonga 
+ON torrent_search_indexes USING pgroonga (search_text) 
+WITH (tokenizer='TokenBigram');
 
--- UI Filter Indexes
+-- 7c) Main Torrents Table Search Index (Crucial for Tiering)
+DROP INDEX IF EXISTS ix_torrents_name_pgroonga;
+CREATE INDEX ix_torrents_name_pgroonga 
+ON torrents USING pgroonga (name) 
+WITH (tokenizer='TokenBigram');
+
+-- 7d) UI Filter & Performance Indexes
 CREATE INDEX IF NOT EXISTS idx_torrents_is_spam ON torrents (is_spam) WHERE is_spam = false;
 CREATE INDEX IF NOT EXISTS idx_torrents_extensions_gin ON torrents USING GIN (contained_extensions);
 CREATE INDEX IF NOT EXISTS idx_custom_video_pct ON torrents (custom_video_pct);
-CREATE INDEX IF NOT EXISTS idx_custom_archive_pct ON torrents (custom_archive_pct);
 CREATE INDEX IF NOT EXISTS idx_torrent_files_preview ON torrent_files (info_hash, index) INCLUDE (path, size, extension);
 
--- Provide query planner with better statistics
+-- 8) Statistics Update
 ALTER TABLE torrents ALTER COLUMN name SET STATISTICS 1000;
 ANALYZE torrents;
 ANALYZE torrent_search_indexes;
-
--- =============================================================================
--- 8) Asynchronous Backfill / Janitor Queries (Reference Only)
--- =============================================================================
-/*
-These queries should be run periodically (e.g., via Unraid User Scripts every 15 mins)
-to update the sidecar table and calculate metadata without blocking the crawler.
-
--- A) Update Max Seeders
-UPDATE torrents t
-SET max_seeders = s.m_seeders
-FROM (
-    SELECT info_hash, COALESCE(MAX(seeders), 0) as m_seeders 
-    FROM torrents_torrent_sources 
-    GROUP BY info_hash
-) s
-WHERE t.info_hash = s.info_hash 
-  AND t.max_seeders IS DISTINCT FROM s.m_seeders;
-
--- B) Update Spam, Extensions, and Custom Percentages
-UPDATE torrents t
-SET 
-    is_spam = (EXISTS (SELECT 1 FROM torrent_contents tc WHERE tc.info_hash = t.info_hash AND tc.content_type IN ('movie', 'tv_show') AND t.size < 314572800) OR (COALESCE(t.files_count, 0) > 500 AND t.size < 10485760)),
-    contained_extensions = ARRAY(SELECT DISTINCT LOWER(extension) FROM torrent_files WHERE info_hash = t.info_hash AND extension IS NOT NULL),
-    custom_video_pct = COALESCE((SELECT SUM(size) FROM torrent_files WHERE info_hash = t.info_hash AND get_custom_category(extension) = 'video'), 0) / NULLIF(t.size, 0) * 100.0,
-    custom_archive_pct = COALESCE((SELECT SUM(size) FROM torrent_files WHERE info_hash = t.info_hash AND get_custom_category(extension) = 'archive'), 0) / NULLIF(t.size, 0) * 100.0,
-    custom_app_pct = COALESCE((SELECT SUM(size) FROM torrent_files WHERE info_hash = t.info_hash AND get_custom_category(extension) = 'app'), 0) / NULLIF(t.size, 0) * 100.0
-WHERE t.contained_extensions = '{}'; -- Only calculate for new torrents
-
--- C) Populate the PGroonga Sidecar Table
-INSERT INTO torrent_search_indexes (info_hash, search_text)
-SELECT t.info_hash, t.name || ' ' || COALESCE((
-    SELECT string_agg(tf.path, ' ')
-    FROM torrent_files tf
-    WHERE tf.info_hash = t.info_hash
-), '')
-FROM torrents t
-LEFT JOIN torrent_search_indexes tsi ON t.info_hash = tsi.info_hash
-WHERE tsi.info_hash IS NULL
-ON CONFLICT (info_hash) DO UPDATE 
-SET search_text = EXCLUDED.search_text;
-*/
