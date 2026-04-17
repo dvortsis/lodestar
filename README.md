@@ -155,4 +155,6 @@ Lodestar leverages the raw power of PGroonga Query Syntax. Use this cheat sheet 
 
 ## ❤️ Acknowledgments
 
+This project is a heavily modified fork of the excellent [Bitmagnet-Next-Web](https://github.com/journey-ad/Bitmagnet-Next-Web) by [journey-ad](https://github.com/journey-ad). Lodestar extends the original vision with a focus on PGroonga optimization and specialized discovery workflows.
+
 Maintained with ❤️ for the Bitmagnet data-hoarding community.
