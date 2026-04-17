@@ -9,20 +9,30 @@ import { useTranslations } from "next-intl";
 import clsx from "clsx";
 
 import { SearchIcon } from "@/components/icons";
+import { SEARCH_URL_PRESERVE_KEYS } from "@/config/constant";
+import { useSearchNavigationOptional } from "@/components/SearchNavigationProvider";
+import {
+  hasActiveDiscoveryFilters,
+  searchFacetFromSearchParams,
+} from "@/lib/searchUrl";
 import { $env } from "@/utils";
 
 export const SearchInput = ({
   defaultValue = "",
   isReplace = false,
+  variant = "default",
 }: {
   defaultValue?: string;
   isReplace?: boolean;
+  /** Dark pill bar for the home landing page over the hero background. */
+  variant?: "default" | "landing";
 }) => {
   const [keyword, setKeyword] = useState("");
   const [loading, setLoading] = useState(false);
   const [active, setActive] = useState(false);
   const [errMessage, setErrMessage] = useState("");
   const router = useRouter();
+  const searchNav = useSearchNavigationOptional();
   const searchParams = useSearchParams();
 
   useEffect(() => {
@@ -38,37 +48,45 @@ export const SearchInput = ({
   }, [defaultValue]);
 
   function handleSearch() {
-    // Trim the keyword and set it to state
-    setKeyword(keyword.trim());
+    const trimmed = keyword.trim();
+    setKeyword(trimmed);
 
-    // If keyword is empty, do nothing
-    if (!keyword) {
+    const facet = searchFacetFromSearchParams(searchParams);
+    const discoveryOk =
+      trimmed.length < 2 &&
+      hasActiveDiscoveryFilters({ ...facet, keyword: trimmed });
+
+    if (!trimmed && !discoveryOk) {
       return;
     }
 
-    // If search params equals current search params, do nothing
-    if (searchParams.get("keyword") === keyword && !searchParams.get("p")) {
+    if (searchParams.get("keyword") === trimmed && !searchParams.get("p")) {
       return;
     }
 
-    if (keyword.length < 2) {
-      // If keyword length is less than 2, display warning toast
-      // Toast.warn(t("Toast.keyword_too_short"));
+    if (trimmed.length < 2 && !discoveryOk) {
       setErrMessage(t("Toast.keyword_too_short"));
-
       return;
     }
 
-    if (keyword.length > 100) {
-      // limit keyword length to 100 characters
-      setKeyword(keyword.slice(0, 100));
+    let q = trimmed;
+    if (q.length > 100) {
+      q = q.slice(0, 100);
+      setKeyword(q);
     }
 
-    const params = new URLSearchParams(); // Create URLSearchParams object
+    const params = new URLSearchParams();
 
-    params.set("keyword", keyword.trim()); // Set keyword in URLSearchParams
+    params.set("keyword", q);
 
-    const url = `/search?${params.toString()}`; // Construct URL with search keyword
+    for (const key of SEARCH_URL_PRESERVE_KEYS) {
+      const v = searchParams.get(key);
+      if (v !== null && v !== "") {
+        params.set(key, v);
+      }
+    }
+
+    const url = `/search?${params.toString()}`;
 
     setLoading(true); // Set loading state to true
     if (isReplace) {
@@ -106,13 +124,27 @@ export const SearchInput = ({
   }
 
   const t = useTranslations(); // Translation function
+  const isLanding = variant === "landing";
 
   return (
     <Input
       aria-label="Search"
+      isDisabled={Boolean(searchNav?.isPending)}
+      className={isLanding ? "w-full" : undefined}
+      radius="full"
       classNames={{
-        inputWrapper: "h-12 px-4 bg-default-100",
-        input: "text-base",
+        base: isLanding ? "w-full" : undefined,
+        inputWrapper: clsx(
+          "h-12 px-4",
+          isLanding
+            ? "h-14 min-h-14 rounded-full border border-zinc-600/60 bg-zinc-800/95 shadow-md backdrop-blur-sm data-[hover=true]:bg-zinc-800"
+            : "rounded-full bg-default-100 shadow-sm",
+        ),
+        input: clsx(
+          "text-base",
+          isLanding && "text-zinc-100 placeholder:text-zinc-400",
+        ),
+        innerWrapper: isLanding ? "bg-transparent" : undefined,
         helperWrapper: "absolute bottom-[-25px]",
       }}
       defaultValue={defaultValue}
@@ -121,6 +153,7 @@ export const SearchInput = ({
           <span
             className={clsx(
               "p-2 -m-2 z-10 invisible absolute right-[60px] appearance-none select-none opacity-0 hover:!opacity-60 cursor-pointer active:!opacity-40 rounded-full outline-none text-large transition-opacity motion-reduce:transition-none",
+              isLanding && "text-zinc-400",
               { "!visible opacity-40": active && !!keyword }, // Show clear button if keyword is not empty
             )}
             onPointerDown={() => setKeyword("")}
@@ -143,15 +176,26 @@ export const SearchInput = ({
             isIconOnly
             className={clsx(
               "border-none active:bg-default",
+              isLanding &&
+                "text-zinc-300 hover:bg-zinc-700/80 data-[hover=true]:bg-zinc-700/80",
               { "cursor-progress": loading }, // Change cursor to progress when loading
             )}
+            isDisabled={Boolean(searchNav?.isPending)}
             variant="ghost"
             onClick={handleSearch}
           >
             {loading ? ( // Show spinner if loading, else show search icon
-              <Spinner size="sm" />
+              <Spinner
+                className={isLanding ? "text-zinc-200" : undefined}
+                size="sm"
+              />
             ) : (
-              <SearchIcon className="text-xl text-default-400 pointer-events-none flex-shrink-0" />
+              <SearchIcon
+                className={clsx(
+                  "pointer-events-none flex-shrink-0 text-xl",
+                  isLanding ? "text-zinc-300" : "text-default-400",
+                )}
+              />
             )}
           </Button>
         </>

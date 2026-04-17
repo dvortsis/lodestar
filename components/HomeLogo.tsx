@@ -3,7 +3,7 @@
 import clsx from "clsx";
 import { useState } from "react";
 
-import { MagnetIcon } from "@/components/icons";
+import { LodestarBrandIcon } from "@/components/LodestarBrandIcon";
 import { siteConfig } from "@/config/site";
 import { $env } from "@/utils";
 
@@ -28,16 +28,19 @@ export const HomeLogo = () => {
 
   return (
     <h1
-      className="logo"
-      title={siteConfig.name}
+      className="logo flex flex-col items-center gap-4 text-center"
+      title={siteConfig.brandTitle}
       onPointerDown={() => doClickAnimation()}
     >
-      <MagnetIcon
+      <LodestarBrandIcon
         className={clsx(
-          "w-[140px] h-[140px] transition-all duration-400 hover:scale-105",
+          "h-[140px] w-[140px] object-contain transition-all duration-400 hover:scale-105",
           isAnimating && "animate-pop",
         )}
       />
+      <span className="max-w-xl px-3 text-lg font-medium leading-snug tracking-tight text-foreground md:text-xl">
+        {siteConfig.brandTitle}
+      </span>
     </h1>
   );
 };

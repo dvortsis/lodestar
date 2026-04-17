@@ -1,0 +1,5 @@
+When working on 'service.ts' or SQL queries:
+- ALWAYS use '::text' type casting for string parameters ($1, $2, etc.).
+- REMEMBER the 'torrents' table uses 'tsv' for Full-Text Search.
+- IF a search query crashes with a 500 error, IMMEDIATELY check the @Terminal and propose a fix based on the specific Postgres error code.
+- NEVER assume 'torrent_contents' has a 'title' column; always use the 'Metadata Waterfall' logic (c.title -> tc.search_string -> torrents.name).

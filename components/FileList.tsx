@@ -1,7 +1,7 @@
 "use client";
 
-import React from "react";
-import { Link, Chip } from "@nextui-org/react";
+import React, { useMemo, useState } from "react";
+import { Chip, Input, Link } from "@nextui-org/react";
 import { useTranslations } from "next-intl";
 import clsx from "clsx";
 
@@ -14,7 +14,7 @@ import {
 } from "@/utils";
 import FileTypeIcon from "@/components/FileTypeIcon";
 
-type FileItem = TorrentItemProps["files"][0] & {
+type FileItem = NonNullable<TorrentItemProps["files"]>[number] & {
   index: number | string;
   path: string;
   extension?: string;
@@ -31,13 +31,6 @@ type Directory = {
   children: (Directory | FileItem)[];
 };
 
-/**
- * Constructs a file tree from a flat list of file items.
- *
- * @param {FileItem[]} data - The flat list of file items.
- * @param {number} [maxDepth=3] - The maximum depth of the tree.
- * @returns {Directory[]} The constructed file tree.
- */
 function fileTree(data: FileItem[], maxDepth: number = 3): Directory[] {
   const root: Directory = {
     index: "root",
@@ -52,7 +45,6 @@ function fileTree(data: FileItem[], maxDepth: number = 3): Directory[] {
     const rootName = parts[0];
 
     if (parts.length === 1) {
-      // This is a root-level file
       file.type = "file";
       file.name = rootName;
       root.children.push(file);
@@ -65,12 +57,10 @@ function fileTree(data: FileItem[], maxDepth: number = 3): Directory[] {
       const part = parts[i];
 
       if (i === parts.length - 1) {
-        // It's the last part, so it's a file
         file.type = "file";
         file.name = part;
         currentLevel.children.push(file);
       } else if (i === maxDepth) {
-        // If max depth is reached, treat remaining parts as part of the file name
         const remainingPath = parts.slice(i).join("/");
         const sub = {
           ...file,
@@ -93,7 +83,7 @@ function fileTree(data: FileItem[], maxDepth: number = 3): Directory[] {
             index: "_" + part,
             type: "folder",
             name: part,
-            path: part, // Path is now just the part name
+            path: part,
             children: [],
           };
           currentLevel.children.push(nextLevel);
@@ -107,32 +97,93 @@ function fileTree(data: FileItem[], maxDepth: number = 3): Directory[] {
   return root.children as Directory[];
 }
 
-/**
- * Renders a file or directory item.
- *
- * @param {Object} props - The component props.
- * @param {FileItem | Directory} props.file - The file or directory item.
- * @param {string} [props.highlight] - The text to highlight.
- * @returns {JSX.Element} The rendered file item.
- */
+function filterFilesByNeedle(
+  files: NonNullable<TorrentItemProps["files"]>,
+  needle: string,
+): NonNullable<TorrentItemProps["files"]> {
+  const n = needle.trim().toLowerCase();
+  if (!n) {
+    return files;
+  }
+
+  return files.filter((f) => f.path.toLowerCase().includes(n));
+}
+
 function FileItem({
   file,
   highlight,
+  collapsibleFolders,
 }: {
   file: FileItem | Directory;
   highlight?: string | string[];
+  collapsibleFolders: boolean;
 }) {
+  if (file.type === "folder" && collapsibleFolders) {
+    return (
+      <li className="flex flex-col justify-center mb-1">
+        <details className="group/root open:pb-0" open>
+          <summary className="file-item flex items-center text-xs md:text-sm md:leading-[1rem] cursor-pointer list-none [&::-webkit-details-marker]:hidden">
+            <FileTypeIcon
+              className="dark:brightness-90"
+              extension="folder"
+            />
+            <span
+              className={clsx(
+                "min-w-0 break-all min-h-5 text-default-500",
+              )}
+              title={file.path}
+            >
+              {file.name}
+            </span>
+          </summary>
+          <ul className="sub-list pl-6 pt-1">
+            {file.children.map((child) => (
+              <FileItem
+                key={child.index}
+                collapsibleFolders={collapsibleFolders}
+                file={child}
+                highlight={highlight}
+              />
+            ))}
+          </ul>
+        </details>
+      </li>
+    );
+  }
+
+  if (file.type === "folder" && !collapsibleFolders) {
+    return (
+      <li className="flex flex-col justify-center mb-1">
+        <div className="file-item flex items-center text-xs md:text-sm md:leading-[1rem]">
+          <FileTypeIcon
+            className="dark:brightness-90"
+            extension="folder"
+          />
+          <span
+            className={clsx(
+              "min-w-0 break-all min-h-5 text-default-500",
+            )}
+            title={file.path}
+          >
+            {file.name}
+          </span>
+        </div>
+        <ul className="sub-list pl-6 pt-1">
+          {file.children.map((child) => (
+            <FileItem
+              key={child.index}
+              collapsibleFolders={collapsibleFolders}
+              file={child}
+              highlight={highlight}
+            />
+          ))}
+        </ul>
+      </li>
+    );
+  }
+
   return (
-    <li
-      key={file.index}
-      className="flex flex-col justify-center mb-1"
-      // data-extension={file.type === "file" ? file.extension : null}
-      // data-index={file.index}
-      // data-name={file.name}
-      // data-path={file.path}
-      // data-size={file.type === "file" ? file.size : null}
-      // data-type={file.type}
-    >
+    <li className="flex flex-col justify-center mb-1">
       <div className="file-item flex items-center text-xs md:text-sm md:leading-[1rem]">
         <FileTypeIcon
           className="dark:brightness-90"
@@ -162,56 +213,78 @@ function FileItem({
           </Chip>
         )}
       </div>
-      {file.type === "folder" && (
-        <ul className="sub-list pl-6 pt-1">
-          {file.children.map((child) => (
-            <FileItem key={child.index} file={child} highlight={highlight} />
-          ))}
-        </ul>
-      )}
     </li>
   );
 }
 
-/**
- * Renders a file list for a torrent.
- *
- * @param {Object} props - The component props.
- * @param {TorrentItemProps} props.torrent - The torrent data.
- * @param {string} [props.highlight] - The text to highlight.
- * @param {number} [props.max=-1] - The maximum number of files to show.
- * @returns {JSX.Element} The rendered file list.
- */
 export default function FileList({
   torrent,
   highlight,
   max = -1,
+  collapsibleFolders = true,
+  enableTreeFilter = true,
 }: {
   torrent: TorrentItemProps;
   highlight?: string | string[];
   max?: number;
+  collapsibleFolders?: boolean;
+  enableTreeFilter?: boolean;
 }) {
   const t = useTranslations();
-  const list = max > 0 ? torrent.files.slice(0, max) : torrent.files;
+  const [treeFilter, setTreeFilter] = useState("");
 
-  const tree = fileTree(list as FileItem[], 3);
+  const fileRows = torrent.files ?? [];
+  const baseList = max > 0 ? fileRows.slice(0, max) : fileRows;
+
+  const filteredList = useMemo(
+    () =>
+      enableTreeFilter
+        ? filterFilesByNeedle(baseList, treeFilter)
+        : baseList,
+    [baseList, treeFilter, enableTreeFilter],
+  );
+
+  const tree = useMemo(
+    () => fileTree(filteredList as FileItem[], 3),
+    [filteredList],
+  );
 
   return (
-    <ul>
-      {tree.map((file) => (
-        <FileItem key={file.index} file={file} highlight={highlight} />
-      ))}
-      {max > 0 && torrent.files.length > max && (
+    <div className="space-y-2">
+      {enableTreeFilter && (
+        <Input
+          aria-label={t("Search.file_tree_filter_aria")}
+          classNames={{
+            inputWrapper: "h-9 min-h-9 bg-default-100",
+            input: "text-xs",
+          }}
+          placeholder={t("Search.file_tree_filter_placeholder")}
+          size="sm"
+          value={treeFilter}
+          onValueChange={setTreeFilter}
+        />
+      )}
+      <ul>
+        {tree.map((file) => (
+          <FileItem
+            key={file.index}
+            collapsibleFolders={collapsibleFolders}
+            file={file}
+            highlight={highlight}
+          />
+        ))}
+      </ul>
+      {max > 0 && fileRows.length > max && (
         <Link
           isExternal
           className="text-sm italic text-gray-500"
           href={`/detail/${hexToBase64(torrent.hash)}`}
         >
           {t("Search.more_files", {
-            count: torrent.files.length - max,
+            count: fileRows.length - max,
           })}
         </Link>
       )}
-    </ul>
+    </div>
   );
 }

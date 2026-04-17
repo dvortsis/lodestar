@@ -14,7 +14,7 @@ export const DemoMode = async () => {
       <a
         className="bg-default-100 rounded-sm px-2 py-1 text-sm text-red-500 hover:underline"
         href="https://github.com/journey-ad/Bitmagnet-Next-Web"
-        rel="noreferrer"
+        rel="noopener noreferrer"
         target="_blank"
       >
         {t("COMMON.DEMO_MODE_TIPS")}

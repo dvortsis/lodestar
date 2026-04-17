@@ -10,10 +10,14 @@ const httpLink = new HttpLink({
 const removeTypename = removeTypenameFromVariables();
 
 const client = new ApolloClient({
-  cache: new InMemoryCache({
-    addTypename: false,
-  }),
+  /** Default `addTypename: true` so the cache can normalize by `__typename` + `id` / `keyFields`. */
+  cache: new InMemoryCache(),
   link: from([removeTypename, httpLink]),
+  /** Temporary: always hit network so search/schema changes are not masked by Apollo cache. */
+  defaultOptions: {
+    query: { fetchPolicy: "network-only" },
+    watchQuery: { fetchPolicy: "network-only" },
+  },
 });
 
 export default client;

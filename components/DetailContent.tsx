@@ -146,7 +146,7 @@ export const DetailContent = ({
               </span>
               <span>
                 {t("Search.file_count")}
-                {data.files.length}
+                {data.files_count}
               </span>
               <Suspense key={hydrated ? "load" : "loading"}>
                 <span>
@@ -212,7 +212,11 @@ export const DetailContent = ({
           </CardHeader>
           <Divider className="bg-gray-200 dark:bg-slate-700" />
           <CardBody className="md:px-4">
-            <FileList torrent={data as TorrentItemProps} />
+            <FileList
+              collapsibleFolders
+              enableTreeFilter
+              torrent={data as TorrentItemProps}
+            />
           </CardBody>
           <Divider className="bg-gray-200 dark:bg-slate-700" />
           <CardFooter className="bg-gray-100 dark:bg-slate-800 p-2 px-3">
@@ -223,7 +227,7 @@ export const DetailContent = ({
               </span>
               <span>
                 {t("Search.file_count")}
-                {data.files.length}
+                {data.files_count}
               </span>
               <Suspense key={hydrated ? "load" : "loading"}>
                 <span>

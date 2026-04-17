@@ -10,15 +10,14 @@ import { siteConfig } from "@/config/site";
 import { fontSans, fontNoto, fontMono } from "@/config/fonts";
 import { DemoMode } from "@/components/DemoMode";
 import { BgEffect } from "@/components/BgEffect";
-
 export const metadata: Metadata = {
   title: {
-    default: siteConfig.name,
-    template: `%s - ${siteConfig.name}`,
+    default: siteConfig.brandTitle,
+    template: `%s · ${siteConfig.name}`,
   },
   description: siteConfig.description,
   icons: {
-    icon: "/favicon.ico",
+    icon: "/compass_icon.ico",
   },
 };
 
@@ -62,10 +61,10 @@ export default async function RootLayout({
               enableSystem: true,
             }}
           >
-            <div className="relative flex flex-col h-full">
+            <div className="relative flex h-full min-h-0 flex-col overflow-visible">
               <DemoMode />
               <BgEffect />
-              <main className="container w-full md:w-4/5 mx-auto max-w-6xl flex-grow z-10">
+              <main className="container z-10 mx-auto min-w-0 w-full max-w-6xl flex-grow overflow-visible md:w-4/5">
                 {children}
               </main>
             </div>

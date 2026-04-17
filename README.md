@@ -1,117 +1,158 @@
-<div align="center">
-<img src=".readme/Logo.svg" width="100" height="100" alt="Bitmagnet-Next-Web" />
+<img align="left" width="90" height="90" src="public/compass_logo.png" alt="Lodestar Logo">
 
-<h1>Bitmagnet-Next-Web</h1>
+# Lodestar
+**A beautiful, high-performance discovery interface for [Bitmagnet](https://github.com/bitmagnet-io/bitmagnet).**
+<br><br>
 
-English / [中文文档](./README_zh-CN.md)
+Lodestar acts as a heavily customized frontend that connects to your existing Bitmagnet database and translates standard queries into highly optimized **PGroonga** network commands. This unlocks advanced features like tiered relevance ranking, deep file-path searching, and progressive UI filtering, allowing you to parse millions of torrents in milliseconds.
 
-A more modern magnet search website program, developed using [Next.js 14](https://nextjs.org/docs/getting-started) + [NextUI v2](https://nextui.org/), with the backend powered by [Bitmagnet](https://github.com/bitmagnet-io/bitmagnet).
+---
 
-![Index](.readme/en_Index.jpg)
-![Search](.readme/en_Search.jpg)
+![Lodestar Screenshot 1](public/Screenshot%201.png)
+![Lodestar Screenshot 2](public/Screenshot%202.png)
 
-</div>
+---
 
-## Deployment Instructions
+## ⚡ Why Lodestar? (Improvements Over Native)
 
-### Container Deployment
+While the native Bitmagnet web interface is great for basic management, Lodestar is engineered specifically as a high-speed, aesthetically driven **discovery engine**.
 
-The most convenient way to deploy is using Docker Compose. Refer to the [docker-compose.yml](./docker-compose.yml)
+* **Information Density:** Say goodbye to clunky, screen-hogging cards. Lodestar utilizes a bespoke accordion layout that keeps critical metadata (Size, Seeders, Magnet Link, Age) visible at all times, without overwhelming your screen.
+* **Progressive Disclosure UI:** The interface remains whisper-quiet by default. Heavy machinery like Regex exclusions, spam toggles, and payload compositions are tucked neatly into a collapsible "Advanced Filters" drawer. 
+* **Zero-Cost Infinite Scrolling:** Expanding a torrent instantly loads a cached preview of its files with zero network cost. If you scroll to the bottom of a massive 500-episode anime pack, Lodestar seamlessly "lazy loads" the rest of the files in the background without locking up your browser.
+* **Smart Single-File Fallbacks:** Native Bitmagnet hides single-file torrents from the file tree entirely. Lodestar's backend dynamically synthesizes these missing files so your UI never awkwardly says "No files available" for a standard movie release.
 
-### Running with docker run
+## 🏆 The Discovery Engine 
 
-If not using Docker Compose, you can run each container separately using the following commands:
+Lodestar automatically detects and configures itself for the following ranking tiers:
 
-1. Run the PostgreSQL container:
+* **🥇 Gold Tier:** The holy grail. The user's query exists in both the torrent **Title** AND the internal **File List** (e.g., Season Packs).
+* **🥈 Silver Tier:** The query matches the **Title** of the torrent.
+* **🥉 Bronze Tier:** The query matches deep within the **File List**. These are ranked by *Density* (a torrent with 50 matching files ranks higher than one with 2 matching files).
 
-```bash
-docker run -d \
-  --name bitmagnet-postgres \
-  -p 5432:5432 \
-  -e POSTGRES_PASSWORD=postgres \
-  -e POSTGRES_DB=bitmagnet \
-  -e PGUSER=postgres \
-  -v ./data/postgres:/var/lib/postgresql/data \
-  --shm-size=1g \
-  postgres:16-alpine
-```
+Ties are mathematically broken using swarm health (Seeders/Leechers) and Time Decay (new releases get a freshness boost).
 
-2. Run the Bitmagnet container:
+---
 
-```bash
-docker run -d \
-  --name bitmagnet \
-  --link bitmagnet-postgres:postgres \
-  -p 3333:3333 \
-  -p 3334:3334/tcp \
-  -p 3334:3334/udp \
-  -e POSTGRES_HOST=postgres \
-  -e POSTGRES_PASSWORD=postgres \
-  ghcr.io/bitmagnet-io/bitmagnet:latest \
-  worker run --keys=http_server --keys=queue_server --keys=dht_crawler
-```
+## 🧱 Under the Hood (Tech Stack)
 
-3. Run the Bitmagnet-Next-Web container:
+Lodestar leverages modern web and database technologies to keep resource usage incredibly low:
+* **Frontend:** Built on **Next.js, React, & NextUI**. Server-side rendered for immediate load times.
+* **Database:** Connects directly to **PostgreSQL**.
+* **Search Engine:** **PGroonga**. A blazingly fast full-text search extension for Postgres, purpose-built for handling complex symbols, wildcards, and multilingual queries.
+* **Sync Engine:** A lightweight **Node.js** Janitor script that uses highly optimized Postgres UPSERTs to keep the search index perfectly synced with Bitmagnet's crawler.
 
-```bash
-docker run -d \
-  --name bitmagnet-next-web \
-  --link bitmagnet-postgres:postgres \
-  -p 3000:3000 \
-  -e POSTGRES_DB_URL=postgres://postgres:postgres@postgres:5432/bitmagnet \
-  journey0ad/bitmagnet-next-web:latest
-```
+---
 
-### Full-Text Search Optimization
+## Part 1: Prerequisites
 
-The search capability relies on the `torrents.name` and `torrent_files.path` columns. The original Bitmagnet does not index these columns, so it's recommended to create indexes to improve query efficiency:
+Before starting, ensure you have the following installed on your server or machine:
+
+1.  **Bitmagnet & PostgreSQL**: A running Bitmagnet instance.
+2.  **PGroonga Extension**: Your Postgres database must have the PGroonga extension installed (this is standard in most Bitmagnet Docker setups).
+3.  **Docker** (Recommended) or **Node.js** (LTS Version from nodejs.org).
+
+---
+
+## Part 2: Database Preparation
+
+Lodestar's "Gold Tier" deep-file searching requires a flattened sidecar table to prevent your server's RAM from crashing during large queries. 
+
+**CRITICAL STEP**: You must run this SQL command in your Bitmagnet database console before starting the app:
 
 ```sql
-create extension pg_trgm; -- Enable pg_trgm extension
+CREATE TABLE IF NOT EXISTS torrent_search_indexes (
+    info_hash bytea PRIMARY KEY,
+    search_text text
+);
 
--- Create indexes on `torrents.name` and `torrent_files.path`
-CREATE INDEX idx_torrents_name_1 ON torrents USING gin (name gin_trgm_ops);
-CREATE INDEX idx_torrent_files_path_1 ON torrent_files USING gin (path gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS ix_torrent_search_pgroonga 
+ON torrent_search_indexes USING pgroonga (search_text) 
+WITH (tokenizer='TokenDelimit');
 ```
 
-## Development Guide
+---
 
-Before starting development, create a `.env.local` file in the project root directory and fill in the environment variables:
+## Part 3: Configuration (.env file)
 
-```bash
-# .env.local
-POSTGRES_DB_URL=postgres://postgres:postgres@localhost:5432/bitmagnet
+Lodestar uses a hidden configuration file named `.env` to know how to securely talk to your Bitmagnet database. 
+
+Create a file named `.env` in the root of the `lodestar` folder. It should look like this:
+
+```text
+POSTGRES_DB_URL="postgresql://username:password@localhost:5432/bitmagnet"
 ```
 
-It's recommended to use `pnpm` as the package manager.
+### When and How to Change the Database URL (`POSTGRES_DB_URL`)
 
-### Install Dependencies
+  * **If using Docker (Recommended)**: Change `localhost` to the exact name of your database container in your compose file (usually `postgres` or `db`). Example: `POSTGRES_DB_URL="postgresql://username:password@postgres:5432/bitmagnet"`
+  * **If running manually (Node.js)**: If Lodestar is running on the *same* OS as your database, leave it as `localhost`. If your database is on a different server, change `localhost` to that server's IP address (e.g., `192.168.1.50`).
 
-```bash
-pnpm install
+---
+
+## Part 4: Installing & Running the App
+
+### Option A: Docker Compose (Recommended)
+Docker handles downloading all dependencies automatically.
+
+1.  Download or clone this project folder (`lodestar`) to your server.
+2.  Open your existing Bitmagnet `docker-compose.yml` file.
+3.  Add Lodestar as a new service at the bottom:
+
+```yaml
+  lodestar:
+    build: ./path/to/lodestar/folder
+    container_name: lodestar
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - POSTGRES_DB_URL=postgresql://username:password@postgres:5432/bitmagnet
+    depends_on:
+      - postgres
 ```
+4.  Run `docker compose up -d --build lodestar` to install and start the frontend.
 
-### Run Development Environment
+### Option B: Manual Installation (Node.js)
+1.  Open **PowerShell** or **Terminal**.
+2.  Navigate to the folder where you saved the project (e.g., `cd /opt/lodestar`).
+3.  Install the required background libraries by typing:
+    `npm install pg dotenv --save --legacy-peer-deps`
+4.  Build the application:
+    `npm run build`
+5.  Start the server:
+    `npm run start`
 
-```bash
-pnpm run dev
-```
+---
 
-### Build & Deploy
+## Part 5: The Janitor Script (Maintenance)
 
-```bash
-pnpm run build
-pnpm run serve
-```
+As Bitmagnet discovers new torrents, they must be pushed into the sidecar search index we created in Part 2. The `janitor.js` script handles this effortlessly via Postgres UPSERTs. 
 
-## Credits
+You must set this script to run automatically in the background every 15 to 30 minutes (using a Cron Job or an Unraid User Script).
 
-- [Bitmagnet](https://github.com/bitmagnet-io/bitmagnet)
-- [Next.js](https://nextjs.org/)
-- [NextUI](https://nextui.org/)
-- [Tailwind CSS](https://tailwindcss.com/)
-- [Fluent Emoji](https://github.com/microsoft/fluentui-emoji)
+* **If running via Docker**, your cron command should be:
+    `docker exec lodestar node scripts/janitor.js`
+* **If running manually**, your cron command should be:
+    `node /path/to/lodestar/scripts/janitor.js`
 
-## License
+---
 
-Licensed under the [MIT license](./LICENSE).
+## Part 6: Search Syntax Guide
+
+Lodestar leverages the raw power of PGroonga Query Syntax. Use this cheat sheet to find exactly what you are looking for:
+
+| Feature | Syntax | Example |
+| :--- | :--- | :--- |
+| **Wildcards** | `*` at the end | `comput*` finds computer, computing, etc. |
+| **Exclusion** | `-` before a word | `knight -joker` hides results containing Joker. |
+| **OR Logic** | `OR` or `\|` | `batman OR superman` |
+| **Exact Phrase**| `" "` | `"the dark knight"` |
+| **Proximity** | `*W"..." distance`| `*W"star wars" 5` (words within 5 positions). |
+| **Regex** | `~ "pattern"` | `~ "S0[1-9]E[0-9]"` (Finds TV episode patterns). |
+
+---
+
+## ❤️ Acknowledgments
+
+Maintained with ❤️ for the Bitmagnet data-hoarding community.
