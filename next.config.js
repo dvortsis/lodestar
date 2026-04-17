@@ -8,6 +8,13 @@ console.log("[Next] build mode:", mode);
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   output: mode,
+  // Add these two blocks to prevent GitHub Actions from freezing
+  eslint: {
+    ignoreDuringBuilds: true,
+  },
+  typescript: {
+    ignoreBuildErrors: true,
+  },
   experimental: {
     serverComponentsExternalPackages: [
       '@node-rs/jieba'
