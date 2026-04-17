@@ -1,20 +1,12 @@
-export function getBaseUrl() {
-  // Check if NEXT_PUBLIC_BASE_URL is set
-  if (process.env.NEXT_PUBLIC_BASE_URL) {
-    return process.env.NEXT_PUBLIC_BASE_URL;
-  }
+import { resolveServerApiUrl } from "@/utils/resolveServerApiUrl";
 
-  // Fallback to localhost with port 3000
-  const host = process.env.NEXT_PUBLIC_HOST || "localhost";
-  const port = parseInt(process.env.PORT || "3000", 10);
-
-  return `http://${host}:${port}`;
-}
+export { resolveServerApiUrl };
 
 async function apiFetch(endpoint: string, options?: RequestInit): Promise<any> {
   try {
-    const baseUrl = getBaseUrl();
-    const url = `${baseUrl}${endpoint}`;
+    const path = endpoint.startsWith("/") ? endpoint : `/${endpoint}`;
+    const url =
+      typeof window !== "undefined" ? path : resolveServerApiUrl(path);
     const response = await fetch(url, options);
 
     if (!response.ok) {

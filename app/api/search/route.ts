@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { gql } from "@apollo/client";
 import { z } from "zod";
 
-import client from "@/lib/apolloClient";
+import client from "@/lib/apolloClient.server";
 import {
   SEARCH_PARAMS,
   SEARCH_KEYWORD_LENGTH_MAX,

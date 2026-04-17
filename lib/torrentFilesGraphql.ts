@@ -1,5 +1,3 @@
-import { getBaseUrl } from "@/utils/api";
-
 const TORRENT_FILES_QUERY = `
 query TorrentFiles($infoHash: String!, $search: String, $limit: Int!, $offset: Int!) {
   torrentFiles(infoHash: $infoHash, search: $search, limit: $limit, offset: $offset) {
@@ -30,7 +28,7 @@ export async function fetchTorrentFilesPage(args: {
   limit: number;
   offset: number;
 }): Promise<TorrentFilesPagePayload> {
-  const res = await fetch(`${getBaseUrl()}/api/graphql`, {
+  const res = await fetch("/api/graphql", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({

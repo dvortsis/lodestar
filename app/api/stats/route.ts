@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { gql } from "@apollo/client";
 
-import client from "@/lib/apolloClient";
+import client from "@/lib/apolloClient.server";
 
 // Define the GraphQL query to fetch torrent details by hash
 const query = gql`

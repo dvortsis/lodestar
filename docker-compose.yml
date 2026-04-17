@@ -9,6 +9,8 @@ services:
     restart: unless-stopped
     environment:
       - POSTGRES_DB_URL=postgres://postgres:postgres@postgres:5432/bitmagnet
+      # SSR self-requests: optional if Host/forwarded headers are wrong inside the network
+      # - INTERNAL_APP_URL=http://127.0.0.1:3000
       # - POSTGRES_HOST=postgres
       # - POSTGRES_PASSWORD=postgres
     depends_on:
