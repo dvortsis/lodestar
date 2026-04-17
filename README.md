@@ -57,9 +57,19 @@ Before starting, ensure you have the following installed on your server or machi
 
 ## Part 2: Database Preparation
 
-Lodestar's "Gold Tier" deep-file searching requires a flattened sidecar table to prevent your server's RAM from crashing during large queries. 
+⚠️ **CRITICAL WARNING: BACKUP YOUR DATABASE FIRST** ⚠️
+Lodestar's deep-file searching requires structural changes to your database indexes. While safe, it is **highly recommended** to back up your database before proceeding. We are not responsible for corrupted data!
 
-**CRITICAL STEP**: You must run this SQL command in your Bitmagnet database console before starting the app:
+**To backup via Docker:**
+```bash
+docker exec -t <postgres-container-name> pg_dump -U <username> bitmagnet > bitmagnet_backup.sql
+```
+*(Replace `<postgres-container-name>` and `<username>` with your actual compose values, typically `postgres` for both).*
+
+---
+
+**THE SQL SCRIPT:**
+Once backed up, you must run this SQL command in your Bitmagnet database console before starting the app. This creates the sidecar table and applies the `TokenBigram` indexing necessary for the search engine to function correctly.
 
 ```sql
 CREATE TABLE IF NOT EXISTS torrent_search_indexes (
