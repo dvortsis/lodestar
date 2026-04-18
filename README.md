@@ -30,7 +30,7 @@ While the native Bitmagnet web interface is great for basic management, Lodestar
 Most torrent search engines rely on basic OR logic, which fills your results with noisy, irrelevant data. Lodestar uses a custom-built **Semantic Waterfall Engine** directly inside Postgres. It evaluates queries across 8 strict tiers, isolating the exact releases you want while burying the "data dump" noise.
 
 * **Tier 1 - Exact Phrase (100M points):** The holy grail. The user's exact phrase exists perfectly in the title.
-* **Tier 2 - Fuzzy Ordered Phrase (75M points):** Accounts for plurals and suffixes (e.g., searching "teen leak" safely matches "teens leak") while maintaining strict word order using ultra-fast native ILIKE operators.
+* **Tier 2 - Fuzzy Ordered Phrase (75M points):** Accounts for plurals and suffixes while maintaining strict word order using ultra-fast native ILIKE operators.
 * **Tier 3 - Strict Intersection (50M points):** "All Words" match. Dynamically calculates `minRequiredWords` to ensure true Boolean AND logic, even if words are out of order.
 * **Tier 4 - PGroonga Partial Hit (10M points):** General fuzzy/partial token matches within the title.
 * **Tiers 5 through 8 (File Deep-Search):** The exact same logic as above, but applied to the internal file lists. Mathematical caps prevent a torrent with massive file lists from ever outranking a direct Title match.
