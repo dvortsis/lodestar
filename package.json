@@ -5,7 +5,8 @@
 		"dev": "next dev",
 		"build": "cross-env BUILD_MODE=standalone next build",
 		"start": "next start",
-		"lint": "eslint . --ext .ts,.tsx -c .eslintrc.json --fix"
+		"lint": "eslint . --ext .ts,.tsx -c .eslintrc.json --fix",
+		"janitor": "node scripts/janitor.js"
 	},
 	"dependencies": {
 		"@apollo/client": "^3.10.4",

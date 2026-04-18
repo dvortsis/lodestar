@@ -12,24 +12,30 @@ import {
   Button,
   Card,
   CardBody,
-  Checkbox,
   Input,
   Link,
   Popover,
   PopoverContent,
   PopoverTrigger,
-  Radio,
-  RadioGroup,
   Select,
   SelectItem,
   Slider,
   Switch,
-  Tab,
-  Tabs,
 } from "@nextui-org/react";
-import { Info } from "lucide-react";
+import {
+  Ban,
+  CheckCircle2,
+  CircleDashed,
+  Info,
+  PieChart,
+  Shield,
+  Type,
+} from "lucide-react";
 import clsx from "clsx";
-import { useSearchParams } from "next/navigation";
+import {
+  type ReadonlyURLSearchParams,
+  useSearchParams,
+} from "next/navigation";
 import {
   useCallback,
   useEffect,
@@ -62,15 +68,47 @@ import {
 } from "@/lib/searchUrl";
 import type { FileCategory } from "@/lib/fileUtils";
 import {
+  COMPOSITION_CATEGORY_ICON,
+  COMPOSITION_DISPLAY_ORDER,
+} from "@/lib/compositionCategoryUi";
+import {
   COMPOSITION_CATEGORIES,
   COMPOSITION_PARAM_KEYS,
-  EMPTY_COMPOSITION_FACET,
   compositionFacetFromParams,
+  hasActiveCompositionFilters,
   isCompositionRuleActive,
   parseCompositionParam,
   serializeCompositionRule,
   type CompositionFacetFields,
+  type CompositionRule,
 } from "@/lib/compositionFilter";
+
+const DEFAULT_INCLUDE_PERCENT = 10;
+
+type AdvancedDraftFilters = {
+  hideSpam: boolean;
+  excludeWordsEnabled: boolean;
+  excludeWords: string;
+  composition: CompositionFacetFields;
+};
+
+function readAdvancedDraftFromSearchParams(
+  sp: ReadonlyURLSearchParams,
+): AdvancedDraftFilters {
+  return {
+    hideSpam: sp.get("hideSpam") === "0" ? false : DEFAULT_HIDE_SPAM,
+    excludeWordsEnabled:
+      sp.get("excludeWordsEnabled") === "1"
+        ? true
+        : sp.get("excludeWordsEnabled") === "0"
+          ? false
+          : DEFAULT_EXCLUDE_WORDS_ENABLED,
+    excludeWords: sp.get("excludeWords") || "",
+    composition: compositionFacetFromParams((k) => sp.get(k) ?? ""),
+  };
+}
+
+const SEGMENT_ICON_CLASS = "h-[14px] w-[14px] shrink-0";
 
 function CompositionCategoryRow({
   category,
@@ -89,127 +127,154 @@ function CompositionCategoryRow({
   const paramKey = COMPOSITION_PARAM_KEYS[category] as keyof CompositionFacetFields;
   const raw = String(composition[paramKey] ?? "");
   const rule = parseCompositionParam(raw);
-  const active = isCompositionRuleActive(rule);
+  const tri: "ignore" | "exclude" | "include" = !isCompositionRuleActive(rule)
+    ? "ignore"
+    : rule.mode === "exclude"
+      ? "exclude"
+      : "include";
 
-  const setRule = (next: typeof rule) => {
+  const setRule = (next: CompositionRule) => {
     onCompositionChange({
       [paramKey]: serializeCompositionRule(next),
     });
   };
 
+  const showThresholdSlider = rule.mode === "include";
+  const sliderPercent =
+    rule.mode === "include"
+      ? Math.min(100, Math.max(1, rule.percent || DEFAULT_INCLUDE_PERCENT))
+      : 1;
+
+  const CategoryIcon = COMPOSITION_CATEGORY_ICON[category];
+
+  const categoryIconClass = clsx(
+    "h-[14px] w-[14px] shrink-0",
+    tri === "include" &&
+      "text-blue-400 drop-shadow-[0_0_5px_rgba(96,165,250,0.5)]",
+    tri === "exclude" && "text-red-400",
+    tri === "ignore" && "text-gray-500",
+  );
+
+  const segmentBase =
+    "flex min-w-0 items-center justify-center gap-1.5 rounded-full px-3 py-1 text-xs font-medium transition-all duration-200 disabled:cursor-not-allowed disabled:opacity-40";
+  const segmentInactive =
+    "text-gray-500 hover:bg-gray-800/50 hover:text-gray-300";
+
   return (
-    <div className="flex flex-col gap-2 border-b border-divider py-3 last:border-b-0 last:pb-0">
-      <Checkbox
-        classNames={{
-          base: "max-w-full items-start",
-          label: "text-xs font-semibold text-default-700",
-        }}
-        size="sm"
-        isDisabled={disabled}
-        isSelected={active}
-        onValueChange={(checked) => {
-          if (!checked) {
-            onCompositionChange({ [paramKey]: "" });
-          } else {
-            onCompositionChange({
-              [paramKey]: serializeCompositionRule({
-                mode: "include",
-                percent: 0,
-                metric: "size",
-              }),
-            });
-          }
-        }}
-      >
-        {label}
-      </Checkbox>
-      {active && (
-        <div className="flex flex-col gap-3 pl-6 lg:flex-row lg:flex-wrap lg:items-end">
-          <RadioGroup
-            classNames={{ wrapper: "gap-3" }}
-            isDisabled={disabled}
-            orientation="horizontal"
-            size="sm"
-            value={rule.mode === "exclude" ? "exclude" : "include"}
-            onValueChange={(v) => {
-              if (v === "exclude") {
-                onCompositionChange({ [paramKey]: "exclude" });
-              } else {
-                setRule({
-                  mode: "include",
-                  percent: rule.percent,
-                  metric: rule.metric,
-                });
-              }
-            }}
-          >
-            <Radio className="text-xs" value="include">
-              {t("Search.composition_mode_include")}
-            </Radio>
-            <Radio className="text-xs" value="exclude">
-              {t("Search.composition_mode_exclude")}
-            </Radio>
-          </RadioGroup>
-          {rule.mode === "include" && (
-            <>
-              <div className="flex min-w-[min(100%,14rem)] flex-1 flex-col gap-1 sm:min-w-[16rem]">
+    <div className="py-1.5">
+      <div className="flex items-center justify-between gap-2">
+        <div className="flex min-w-0 flex-1 items-center gap-1.5">
+          <CategoryIcon
+            aria-hidden
+            className={categoryIconClass}
+            strokeWidth={2}
+          />
+          <span className="truncate text-xs font-semibold text-slate-600 dark:text-gray-300">
+            {label}
+          </span>
+        </div>
+        <div className="flex min-w-0 shrink-0 flex-wrap items-center justify-end gap-x-4 gap-y-2">
+          {showThresholdSlider ? (
+            <div className="flex w-32 shrink-0 items-center gap-2 sm:w-40">
+              <span className="sr-only">
+                {t("Search.composition_threshold_label", { n: sliderPercent })}
+              </span>
+              <div className="min-w-0 flex-1">
                 <Slider
-                  aria-label={label}
-                  className="max-w-md"
+                  aria-label={t("Search.composition_threshold_aria", {
+                    category: label,
+                  })}
+                  className="w-full max-w-full"
                   isDisabled={disabled}
                   maxValue={100}
-                  minValue={0}
+                  minValue={1}
                   size="sm"
-                  step={5}
-                  value={rule.percent}
+                  step={1}
+                  value={sliderPercent}
                   onChange={(v) => {
                     const n = Array.isArray(v) ? v[0] : v;
-                    const rounded = Math.min(
-                      100,
-                      Math.max(0, Math.round(Number(n) / 5) * 5),
-                    );
+                    const pct = Math.min(100, Math.max(1, Math.round(Number(n))));
                     setRule({
                       mode: "include",
-                      percent: rounded,
-                      metric: rule.metric,
+                      percent: pct,
+                      metric: "count",
                     });
                   }}
                 />
-                <span className="text-[11px] text-default-500">
-                  {rule.percent <= 0
-                    ? t("Search.composition_slider_any")
-                    : t("Search.composition_slider_percent", {
-                        n: rule.percent,
-                      })}
-                </span>
               </div>
-              <Tabs
-                aria-label={t("Search.composition_metric_aria")}
-                classNames={{
-                  tabList: "gap-1",
-                  tab: "h-7 min-w-0 px-2 text-xs",
-                }}
-                color="default"
-                isDisabled={disabled || rule.percent <= 0}
-                selectedKey={rule.metric}
-                size="sm"
-                variant="bordered"
-                onSelectionChange={(key) => {
-                  const metric = key === "count" ? "count" : "size";
-                  setRule({
-                    mode: "include",
-                    percent: rule.percent,
-                    metric,
-                  });
-                }}
-              >
-                <Tab key="size" title={t("Search.composition_metric_size")} />
-                <Tab key="count" title={t("Search.composition_metric_count")} />
-              </Tabs>
-            </>
-          )}
+              <span className="w-9 shrink-0 text-right text-xs font-medium tabular-nums text-default-600">
+                {sliderPercent}%
+              </span>
+            </div>
+          ) : null}
+          <div
+            className="inline-flex shrink-0 items-center rounded-full border border-gray-700/50 bg-gray-900/80 p-0.5"
+            role="group"
+            aria-label={t("Search.composition_segment_group_aria", {
+              category: label,
+            })}
+          >
+            <button
+              type="button"
+              disabled={disabled}
+              aria-pressed={tri === "include"}
+              className={clsx(
+                segmentBase,
+                tri === "include"
+                  ? "bg-blue-500/15 text-blue-400 shadow-sm"
+                  : segmentInactive,
+              )}
+              onClick={() => {
+                setRule({
+                  mode: "include",
+                  percent:
+                    rule.mode === "include" && rule.percent > 0
+                      ? rule.percent
+                      : DEFAULT_INCLUDE_PERCENT,
+                  metric: "count",
+                });
+              }}
+            >
+              <CheckCircle2 className={SEGMENT_ICON_CLASS} aria-hidden />
+              <span className="truncate">{t("Search.composition_segment_include")}</span>
+            </button>
+            <button
+              type="button"
+              disabled={disabled}
+              aria-pressed={tri === "ignore"}
+              className={clsx(
+                segmentBase,
+                tri === "ignore"
+                  ? "bg-gray-700/50 text-gray-200 shadow-sm"
+                  : segmentInactive,
+              )}
+              onClick={() => {
+                onCompositionChange({ [paramKey]: "" });
+              }}
+            >
+              <CircleDashed className={SEGMENT_ICON_CLASS} aria-hidden />
+              <span className="truncate">{t("Search.composition_segment_ignore")}</span>
+            </button>
+            <button
+              type="button"
+              disabled={disabled}
+              aria-pressed={tri === "exclude"}
+              className={clsx(
+                segmentBase,
+                tri === "exclude"
+                  ? "bg-red-500/15 text-red-400 shadow-sm"
+                  : segmentInactive,
+              )}
+              onClick={() => {
+                setRule({ mode: "exclude", percent: 0, metric: "count" });
+              }}
+            >
+              <Ban className={SEGMENT_ICON_CLASS} aria-hidden />
+              <span className="truncate">{t("Search.composition_segment_exclude")}</span>
+            </button>
+          </div>
         </div>
-      )}
+      </div>
     </div>
   );
 }
@@ -249,28 +314,33 @@ export function SearchFilters() {
     });
   }, [facet.customSizeMin, facet.customSizeMax, facet.customSizeUnit]);
 
-  const [localComposition, setLocalComposition] =
-    useState<CompositionFacetFields>(() =>
-      compositionFacetFromParams((k) => searchParams.get(k) ?? ""),
-    );
-
-  const compUrlSignature = useMemo(
-    () =>
-      COMPOSITION_CATEGORIES.map(
+  const advancedUrlSignature = useMemo(() => {
+    const parts = [
+      searchParams.get("hideSpam") ?? "",
+      searchParams.get("excludeWordsEnabled") ?? "",
+      searchParams.get("excludeWords") ?? "",
+      ...COMPOSITION_CATEGORIES.map(
         (c) => searchParams.get(COMPOSITION_PARAM_KEYS[c]) ?? "",
-      ).join("\u001f"),
-    [searchParams],
-  );
+      ),
+    ];
+    return parts.join("\u001f");
+  }, [searchParams]);
+
+  const [draftAdvancedFilters, setDraftAdvancedFilters] =
+    useState<AdvancedDraftFilters>(() =>
+      readAdvancedDraftFromSearchParams(searchParams),
+    );
 
   useEffect(() => {
-    setLocalComposition(
-      compositionFacetFromParams((k) => searchParams.get(k) ?? ""),
-    );
-  }, [compUrlSignature, searchParams]);
+    setDraftAdvancedFilters(readAdvancedDraftFromSearchParams(searchParams));
+  }, [advancedUrlSignature, searchParams]);
 
-  const patchLocalComposition = useCallback(
+  const patchDraftComposition = useCallback(
     (patch: Partial<CompositionFacetFields>) => {
-      setLocalComposition((prev) => ({ ...prev, ...patch }));
+      setDraftAdvancedFilters((prev) => ({
+        ...prev,
+        composition: { ...prev.composition, ...patch },
+      }));
     },
     [],
   );
@@ -315,36 +385,62 @@ export function SearchFilters() {
     });
   };
 
-  const applyComposition = () => {
-    const patch: Record<string, string> = {};
+  const applyAdvancedFilters = () => {
+    const patch: Record<string, string> = {
+      hideSpam: draftAdvancedFilters.hideSpam ? "1" : "0",
+      excludeWordsEnabled: draftAdvancedFilters.excludeWordsEnabled
+        ? "1"
+        : "0",
+      excludeWords: draftAdvancedFilters.excludeWords,
+    };
     for (const cat of COMPOSITION_CATEGORIES) {
       const key = COMPOSITION_PARAM_KEYS[cat] as keyof CompositionFacetFields;
-      patch[key] = localComposition[key] ?? "";
+      const raw = draftAdvancedFilters.composition[key] ?? "";
+      const rule = parseCompositionParam(raw);
+      if (rule.mode === "include" && rule.percent <= 0) {
+        patch[key] = serializeCompositionRule({
+          mode: "include",
+          percent: DEFAULT_INCLUDE_PERCENT,
+          metric: "count",
+        });
+      } else {
+        patch[key] = raw;
+      }
     }
     pushFromPatch(patch);
   };
 
+  const cancelAdvancedFilters = () => {
+    setDraftAdvancedFilters(readAdvancedDraftFromSearchParams(searchParams));
+  };
+
   const locked = isPending;
 
-  const { autoExpand, setAutoExpand } = useAutoExpandFiles();
+  const accordionIconActive =
+    "text-blue-400 drop-shadow-[0_0_5px_rgba(96,165,250,0.5)]";
+  const accordionIconIdle = "text-gray-500";
 
-  const hideSpam =
-    searchParams.get("hideSpam") === "0" ? false : DEFAULT_HIDE_SPAM;
-
-  const excludeWordsEnabled =
-    searchParams.get("excludeWordsEnabled") === "1"
-      ? true
-      : searchParams.get("excludeWordsEnabled") === "0"
-        ? false
-        : DEFAULT_EXCLUDE_WORDS_ENABLED;
-
-  const [excludeDraft, setExcludeDraft] = useState(
-    searchParams.get("excludeWords") || "",
+  const isSpamActive = useMemo(
+    () => draftAdvancedFilters.hideSpam === true,
+    [draftAdvancedFilters.hideSpam],
   );
 
-  useEffect(() => {
-    setExcludeDraft(searchParams.get("excludeWords") || "");
-  }, [searchParams]);
+  const isExcludeActive = useMemo(
+    () =>
+      draftAdvancedFilters.excludeWords.trim().length > 0 ||
+      draftAdvancedFilters.excludeWordsEnabled === true,
+    [
+      draftAdvancedFilters.excludeWords,
+      draftAdvancedFilters.excludeWordsEnabled,
+    ],
+  );
+
+  const isCompositionActive = useMemo(
+    () => hasActiveCompositionFilters(draftAdvancedFilters.composition),
+    [draftAdvancedFilters.composition],
+  );
+
+  const { autoExpand, setAutoExpand } = useAutoExpandFiles();
 
   const showCustomTime = facet.filterTime === "custom";
   const showCustomSize = facet.filterSize === "custom";
@@ -715,7 +811,6 @@ export function SearchFilters() {
                     patch[COMPOSITION_PARAM_KEYS[cat]] = "";
                   }
                   pushFromPatch(patch);
-                  setLocalComposition({ ...EMPTY_COMPOSITION_FACET });
                 }
               }}
             >
@@ -885,6 +980,15 @@ export function SearchFilters() {
                 <AccordionItem
                   key="spam"
                   aria-label={t("Search.advanced_accordion_spam_title")}
+                  startContent={
+                    <Shield
+                      aria-hidden
+                      className={
+                        isSpamActive ? accordionIconActive : accordionIconIdle
+                      }
+                      size={18}
+                    />
+                  }
                   textValue={t("Search.advanced_accordion_spam_title")}
                   title={t("Search.advanced_accordion_spam_title")}
                 >
@@ -895,10 +999,13 @@ export function SearchFilters() {
                         label: "text-xs text-default-700",
                       }}
                       isDisabled={locked}
-                      isSelected={hideSpam}
+                      isSelected={draftAdvancedFilters.hideSpam}
                       size="sm"
                       onValueChange={(v) =>
-                        pushFromPatch({ hideSpam: v ? "1" : "0" })
+                        setDraftAdvancedFilters((prev) => ({
+                          ...prev,
+                          hideSpam: v,
+                        }))
                       }
                     >
                       {t("Search.hideSpam")}
@@ -908,80 +1015,115 @@ export function SearchFilters() {
                 <AccordionItem
                   key="exclude"
                   aria-label={t("Search.advanced_accordion_exclude_title")}
+                  startContent={
+                    <Type
+                      aria-hidden
+                      className={
+                        isExcludeActive
+                          ? accordionIconActive
+                          : accordionIconIdle
+                      }
+                      size={18}
+                    />
+                  }
                   textValue={t("Search.advanced_accordion_exclude_title")}
                   title={t("Search.advanced_accordion_exclude_title")}
                 >
-                  <div className="flex flex-col gap-3 pt-0.5">
+                  <div className="flex w-full flex-row items-center gap-3 pt-0.5">
                     <Switch
                       classNames={{
-                        base: "max-w-full",
-                        label: "text-xs text-default-700",
+                        base: "max-w-fit shrink-0",
+                        label: "text-xs text-default-700 whitespace-nowrap",
                       }}
                       isDisabled={locked}
-                      isSelected={excludeWordsEnabled}
+                      isSelected={draftAdvancedFilters.excludeWordsEnabled}
                       size="sm"
                       onValueChange={(v) =>
-                        pushFromPatch({ excludeWordsEnabled: v ? "1" : "0" })
+                        setDraftAdvancedFilters((prev) => ({
+                          ...prev,
+                          excludeWordsEnabled: v,
+                        }))
                       }
                     >
                       {t("Search.excludeWordsSwitch")}
                     </Switch>
-                    {excludeWordsEnabled ? (
-                      <Input
-                        classNames={{
-                          label: "text-xs md:text-sm",
-                          inputWrapper: "h-11 bg-default-100",
-                          input: "text-sm",
-                        }}
-                        isDisabled={locked}
-                        label={t("Search.excludeWordsLabel")}
-                        labelPlacement="outside"
-                        placeholder={t("Search.excludeWordsPlaceholder")}
-                        size="sm"
-                        value={excludeDraft}
-                        onBlur={() => {
-                          const cur = searchParams.get("excludeWords") || "";
-                          if (excludeDraft !== cur) {
-                            pushFromPatch({ excludeWords: excludeDraft });
+                    {draftAdvancedFilters.excludeWordsEnabled ? (
+                      <div className="min-w-0 flex-1">
+                        <Input
+                          aria-label={t("Search.excludeWordsLabel")}
+                          classNames={{
+                            base: "w-full",
+                            inputWrapper:
+                              "h-8 min-h-8 bg-default-100 py-0 data-[hover=true]:bg-default-200/80",
+                            innerWrapper: "py-0",
+                            input: "text-sm !py-1",
+                          }}
+                          isDisabled={locked}
+                          placeholder={t("Search.excludeWordsPlaceholder")}
+                          size="sm"
+                          value={draftAdvancedFilters.excludeWords}
+                          onValueChange={(v) =>
+                            setDraftAdvancedFilters((prev) => ({
+                              ...prev,
+                              excludeWords: v,
+                            }))
                           }
-                        }}
-                        onValueChange={setExcludeDraft}
-                      />
+                        />
+                      </div>
                     ) : null}
                   </div>
                 </AccordionItem>
                 <AccordionItem
                   key="composition"
                   aria-label={t("Search.advanced_accordion_composition_title")}
+                  startContent={
+                    <PieChart
+                      aria-hidden
+                      className={
+                        isCompositionActive
+                          ? accordionIconActive
+                          : accordionIconIdle
+                      }
+                      size={18}
+                    />
+                  }
                   textValue={t("Search.advanced_accordion_composition_title")}
                   title={t("Search.advanced_accordion_composition_title")}
                 >
                   <div className="flex flex-col gap-3 pt-0.5">
                     <div className="flex flex-col">
-                      {COMPOSITION_CATEGORIES.map((cat) => (
+                      {COMPOSITION_DISPLAY_ORDER.map((cat) => (
                         <CompositionCategoryRow
                           key={cat}
                           category={cat}
-                          composition={localComposition}
+                          composition={draftAdvancedFilters.composition}
                           disabled={locked}
                           label={t(`Search.file_cat_${cat}`)}
-                          onCompositionChange={patchLocalComposition}
+                          onCompositionChange={patchDraftComposition}
                         />
                       ))}
-                    </div>
-                    <div className="flex justify-end border-t border-divider pt-2">
-                      <Button
-                        color="primary"
-                        isLoading={locked}
-                        size="sm"
-                        onPress={applyComposition}
-                      >
-                        {t("Search.composition_apply")}
-                      </Button>
                     </div>
                   </div>
                 </AccordionItem>
               </Accordion>
+              <div className="mt-3 flex flex-wrap justify-end gap-2 border-t border-divider pt-3">
+                <Button
+                  isDisabled={locked}
+                  size="sm"
+                  variant="flat"
+                  onPress={cancelAdvancedFilters}
+                >
+                  {t("Search.advanced_filters_cancel")}
+                </Button>
+                <Button
+                  color="primary"
+                  isLoading={locked}
+                  size="sm"
+                  onPress={applyAdvancedFilters}
+                >
+                  {t("Search.advanced_filters_apply")}
+                </Button>
+              </div>
             </CardBody>
           </Card>
         </div>

@@ -1,5 +1,4 @@
 import { query } from "@/lib/pgdb";
-import { jiebaCut } from "@/lib/jieba";
 import {
   SEARCH_KEYWORD_SPLIT_REGEX,
   SEARCH_EXCLUDE_MAX_LENGTH,
@@ -17,23 +16,21 @@ import {
   COMPOSITION_PARAM_KEYS,
   parseCompositionParam,
 } from "@/lib/compositionFilter";
-import {
-  extensionsForCompositionExclude,
-  type FileCategory,
-} from "@/lib/fileUtils";
+import type { FileCategory } from "@/lib/fileUtils";
 
 /**
  * Lodestar GraphQL search & torrent hydration (`service.ts`)
  *
- * **PGroonga tiering (keyword path):** Title hits, file-path hits (sidecar `torrent_search_indexes`),
- * and dual-axis matches are merged, then scored with explicit **Gold / Silver / Bronze** bands in
- * `base_match_score` (dual hit ≫ title-only ≫ files-only). A bounded `scoring_buffer` caps work
- * before pagination so heavy `pgroonga_score` + lateral joins do not run across the whole corpus.
+ * **Keyword path (PGroonga):** `pgQuery` maps `|`/`OR`/`AND` to spaced ` OR ` / space **outside** `"..."`;
+ * hyphen-terms quoted only when unquoted. `cleanPhrase` strips `"` then normalizes hyphens for Tier 1 / `coreWords`.
  *
  * **Preview & fallbacks:** Search rows embed a capped `files_preview` JSON slice for client “zero-cost”
  * tree open; `formatTorrent` and `torrentFiles` both implement a **single-file synthetic row** when
  * Bitmagnet stores a lone payload without a `torrent_files` row (storage optimization bypass).
  */
+
+/** Max characters of `torrent_search_indexes.search_text` for exact-match substring boost only. */
+const FTS_SIDECAR_SEARCH_TEXT_MAX_CHARS = 500_000;
 
 /** Appended to `torrentByHash` file aggregate only (not used for search list). */
 const torrentFilesSqlLimitClause =
@@ -53,6 +50,8 @@ type Torrent = {
   files_preview?: unknown;
   /** JSONB from DB; search omits per-file rows and relies on this for composition UI */
   file_stats?: unknown;
+  /** JSON object text from `torrent_compositions` join (per-category file counts). */
+  composition_counts?: unknown;
   created_at: number;
   updated_at: number;
   display_name?: string;
@@ -72,53 +71,10 @@ type TorrentFile = {
 
 const REGEX_PADDING_FILE = /^(_____padding_file_|\.pad\/\d+&)/; // Regular expression to identify padding files
 
-export type HybridTsParts = {
-  /** Joined with ` & ` for to_tsquery('simple', …), e.g. `duolingo:*` */
-  prefixToTsquery: string | null;
-  /** Remainder passed to websearch_to_tsquery */
-  websearchRemainder: string | null;
-};
-
-/**
- * Words ending with `*` and a stem of ≥3 chars become prefix lexemes (`stem:*`).
- * Other tokens are passed through for websearch_to_tsquery (phrases, OR, -exclude, etc.).
- */
-export function parseHybridQuery(input: string): HybridTsParts {
-  const trimmed = input.trim();
-  if (!trimmed) {
-    return { prefixToTsquery: null, websearchRemainder: null };
-  }
-
-  const tokens = trimmed.split(/\s+/);
-  const prefixes: string[] = [];
-  const webToks: string[] = [];
-
-  for (const tok of tokens) {
-    if (tok.endsWith("*") && tok.length > 1) {
-      const stem = tok.slice(0, -1);
-      if (stem.length >= 3) {
-        const safe = stem
-          .replace(/[^\p{L}\p{N}_-]/gu, "")
-          .toLowerCase();
-        if (safe.length >= 3) {
-          prefixes.push(`${safe}:*`);
-          continue;
-        }
-      }
-    }
-    webToks.push(tok);
-  }
-
-  return {
-    prefixToTsquery: prefixes.length > 0 ? prefixes.join(" & ") : null,
-    websearchRemainder: webToks.length > 0 ? webToks.join(" ") : null,
-  };
-}
-
 /** Binds a value each call — returns `($n::cast)`. */
 type SqlParamBinder = (val: unknown, sqlCast: string) => string;
 
-/** Exclude-word filter against `torrent_search_indexes.search_text` (sidecar PGroonga source). */
+/** Exclude-word filter against `torrent_search_indexes.search_text` (sidecar full-text source). */
 function buildExcludeSql(p: SqlParamBinder, excludeWords: string[]): string {
   if (excludeWords.length === 0) {
     return "";
@@ -195,6 +151,17 @@ function buildWhereTail(
     ${sizeFilterSql}
     ${spamHideSql}
     ${compositionSql}`;
+}
+
+/**
+ * {@link buildWhereTail} qualifies columns as `torrents.*`. `groonga_hits` uses `FROM torrents t`
+ * only (no bare `torrents` range var), so filter SQL must use `t.` or Postgres raises invalid
+ * FROM-clause reference errors.
+ */
+function whereTailSqlTorrentsToAliasT(whereTailSql: string): string {
+  return whereTailSql
+    .replace(/\btorrents\./g, "t.")
+    .replace(/\btorrents\s+is_spam\b/gi, "t.is_spam");
 }
 
 function parseExcludeWords(raw: string): string[] {
@@ -298,6 +265,13 @@ export function formatTorrent(row: Torrent) {
         : JSON.stringify(row.file_stats)
       : undefined;
 
+  const compositionCountsJson =
+    row.composition_counts != null
+      ? typeof row.composition_counts === "string"
+        ? row.composition_counts
+        : JSON.stringify(row.composition_counts)
+      : undefined;
+
   const rawFiles: TorrentFile[] = Array.isArray(row.files) ? row.files : [];
 
   let rawPreview: unknown = row.files_preview;
@@ -348,6 +322,7 @@ export function formatTorrent(row: Torrent) {
     single_file: row.files_count <= 1,
     files_count: row.files_count || 1,
     file_stats: fileStatsJson,
+    composition_counts: compositionCountsJson,
     files_preview: filesPreview,
     files: (row.files_count > 0 ? rawFiles : generateSingleFiles(row))
       .map((file) => ({
@@ -428,15 +403,36 @@ const buildTimeFilter = (
   return timeFilterMap[filterTime] || "";
 };
 
+/** `torrent_compositions` column for each {@link FileCategory} (1:1 sidecar on `info_hash`). */
+function compositionCountColumn(cat: FileCategory): string {
+  const m: Record<FileCategory, string> = {
+    video: "video_count",
+    audio: "audio_count",
+    archive: "archive_count",
+    app: "app_count",
+    document: "document_count",
+    image: "image_count",
+    other: "other_count",
+  };
+  return m[cat];
+}
+
+/** Scalar subquery: category file count for `torrents` row (0 if no sidecar row). */
+function compositionCountExpr(cat: FileCategory): string {
+  const col = compositionCountColumn(cat);
+  return `COALESCE((SELECT tc.${col} FROM torrent_compositions tc WHERE tc.info_hash = torrents.info_hash), 0)`;
+}
+
 /**
- * Composition filters: custom `torrents.custom_*_pct` for size rules, Bitmagnet `comp_*_count_pct`
- * for count rules, and `torrents.contained_extensions` for exclusions (`&&`).
+ * Composition filters: `torrent_compositions` counts for include / exclude / count-threshold;
+ * legacy `torrents.custom_*_pct` only when include + size + positive percent (bytes not in sidecar).
  * Params: comp_video, comp_audio, comp_archive, comp_app, comp_document, comp_image, comp_other.
  */
 function buildCompositionFilterSql(
   queryInput: Record<string, unknown>,
   bind: (v: unknown, sqlCast: string) => string,
 ): string {
+  /** DB suffix for `torrents.custom_${dbKey}_pct` (size-metric thresholds only). */
   const categoryMap: Record<string, string> = {
     software: "app",
     unknown: "other",
@@ -445,7 +441,6 @@ function buildCompositionFilterSql(
     documents: "doc",
     videos: "video",
     audios: "audio",
-    /** `FileCategory` uses singular keys; align with DB suffixes (`custom_img_pct`, etc.). */
     image: "img",
     document: "doc",
   };
@@ -460,29 +455,25 @@ function buildCompositionFilterSql(
     if (rule.mode === "inactive") {
       continue;
     }
-    const exts = extensionsForCompositionExclude(cat as FileCategory);
 
     if (rule.mode === "exclude") {
-      if (exts.length === 0) {
-        continue;
-      }
-      const arrayParam = bind(exts, "text[]");
-      parts.push(`NOT (torrents.contained_extensions && ${arrayParam})`);
+      parts.push(`${compositionCountExpr(cat)} = 0`);
       continue;
     }
 
-    const dbKey = categoryMap[cat] || cat;
-
     if (rule.percent <= 0) {
-      parts.push(`COALESCE(torrents.custom_${dbKey}_pct, 0) > 0`);
+      parts.push(`${compositionCountExpr(cat)} > 0`);
       continue;
     }
 
     const pctParam = bind(Number(rule.percent), "numeric");
     if (rule.metric === "size") {
-      parts.push(`torrents.custom_${dbKey}_pct >= ${pctParam}`);
+      const dbKey = categoryMap[cat] || cat;
+      parts.push(`COALESCE(torrents.custom_${dbKey}_pct, 0) >= ${pctParam}`);
     } else {
-      parts.push(`torrents.comp_${dbKey}_count_pct >= ${pctParam}`);
+      parts.push(
+        `((${compositionCountExpr(cat)})::numeric * 100.0 / NULLIF(torrents.files_count::numeric, 0)) >= ${pctParam}`,
+      );
     }
   }
   if (parts.length === 0) {
@@ -519,65 +510,10 @@ function sqlIntervalMultiplier(unit: string): string {
   return "interval '1 day'";
 }
 
-const QUOTED_KEYWORD_REGEX = /"([^"]+)"/g;
-
-const extractKeywords = (
-  keyword: string,
-): { keyword: string; required: boolean }[] => {
-  let keywords = [];
-  let match;
-
-  // Extract exact keywords using quotation marks
-  while ((match = QUOTED_KEYWORD_REGEX.exec(keyword)) !== null) {
-    keywords.push({ keyword: match[1], required: true });
-  }
-
-  const remainingKeywords = keyword.replace(QUOTED_KEYWORD_REGEX, "");
-
-  // Extract remaining keywords using regex tokenizer
-  keywords.push(
-    ...remainingKeywords
-      .trim()
-      .split(SEARCH_KEYWORD_SPLIT_REGEX)
-      .map((k) => ({ keyword: k, required: false })),
-  );
-
-  // Use jieba to words segment if input is a full sentence (skip when PGroonga operators present — preserves `comput*`, etc.)
-  if (
-    keywords.length === 1 &&
-    keyword.length >= 4 &&
-    !/[*^|()~]/.test(keyword)
-  ) {
-    keywords.push(...jiebaCut(keyword));
-  }
-
-  // Remove duplicates and filter out keywords shorter than 2 characters to avoid slow SQL queries
-  keywords = Array.from(
-    new Map(keywords.map((k) => [k.keyword, k])).values(),
-  ).filter(({ keyword }) => keyword.trim().length >= 2);
-
-  // Ensure at least 1/3 keyword is required when there is no required keyword
-  if (keywords.length && !keywords.some(({ required }) => required)) {
-    [...keywords]
-      .sort((a, b) => b.keyword.length - a.keyword.length)
-      .slice(0, Math.ceil(keywords.length / 3))
-      .forEach((k) => (k.required = true));
-  }
-
-  const fullKeyword = keyword.replace(/"/g, "");
-
-  // Ensure full keyword is the first item
-  if (!keywords.some((k) => k.keyword === fullKeyword)) {
-    keywords.unshift({ keyword: fullKeyword, required: false });
-  }
-
-  return keywords;
-};
-
 /**
  * Tokens for client title highlighting only — derived from the raw query string.
- * Keeps PGroonga operators / wildcards intact (splitting only on punctuation from
- * {@link SEARCH_KEYWORD_SPLIT_REGEX}), never runs jieba or other re-tokenization.
+ * Splits only on punctuation from {@link SEARCH_KEYWORD_SPLIT_REGEX}; does not interpret
+ * boolean syntax (that is handled in Postgres via PGroonga `&@~` in keyword search).
  */
 function buildSearchHighlightKeywords(raw: string): string[] {
   const t = String(raw ?? "").trim();
@@ -590,18 +526,273 @@ function buildSearchHighlightKeywords(raw: string): string[] {
   return Array.from(new Set(parts));
 }
 
+/** Apply `fn` only to runs **outside** balanced `"..."` spans (no hyphen / AND / OR edits inside quotes). */
+function replaceOutsideDoubleQuotes(
+  s: string,
+  fn: (unquotedFragment: string) => string,
+): string {
+  const re = /"[^"]*"/g;
+  let out = "";
+  let last = 0;
+  let m: RegExpExecArray | null;
+  const src = String(s);
+  re.lastIndex = 0;
+  while ((m = re.exec(src)) !== null) {
+    out += fn(src.slice(last, m.index));
+    out += m[0];
+    last = m.index + m[0].length;
+  }
+  out += fn(src.slice(last));
+  return out;
+}
+
+/**
+ * PGroonga `&@~` string from the **raw** keyword:
+ * - Outside `"..."`: **`|`** → **` OR `**; **` OR `** (word boundary) → uppercase spaced **` OR `**;
+ *   **` AND `** → single space. Parentheses are unchanged; spaces are collapsed afterward.
+ *   Example: `(Ubuntu|Debian) AND "64-bit"` → `(Ubuntu OR Debian) "64-bit"`.
+ * - **Hyphen wrapping** runs only outside quotes: `64-bit` → `"64-bit"`; already-quoted `"64-bit"` is untouched.
+ * - **Negation** `-term` is not matched by the hyphen pattern.
+ */
+function buildPgQueryFromExpanded(rawKeyword: string): string {
+  let s = String(rawKeyword ?? "").trim();
+  s = replaceOutsideDoubleQuotes(s, (frag) =>
+    frag
+      // PGroonga Tokenizer Prep: We must convert `|` to ` OR ` (with spaces)
+      // so the index tokenizer doesn't crash on squished strings like '(Ubuntu|Debian)'.
+      .replace(/\|/g, " OR ")
+      .replace(/\bOR\b/gi, " OR ")
+      .replace(/\bAND\b/gi, " "),
+  );
+  s = s.replace(/\s+/g, " ").trim();
+  s = replaceOutsideDoubleQuotes(s, (frag) =>
+    frag.replace(
+      /\b([A-Za-z0-9]+(?:-[A-Za-z0-9]+)+)\b/g,
+      (full) => `"${full.replace(/"/g, "")}"`,
+    ),
+  );
+  s = s.replace(/\s+/g, " ").trim();
+  return s;
+}
+
+/** True when **outside** `"..."` the query uses boolean / alternation syntax (not plain `(2024)`). */
+function rawKeywordHasBooleanSyntaxOutsideQuotes(raw: string): boolean {
+  const src = String(raw ?? "").trim();
+  const re = /"[^"]*"/g;
+  let last = 0;
+  let m: RegExpExecArray | null;
+  re.lastIndex = 0;
+  while ((m = re.exec(src)) !== null) {
+    if (fragmentLooksBooleanQuery(src.slice(last, m.index))) {
+      return true;
+    }
+    last = m.index + m[0].length;
+  }
+  return fragmentLooksBooleanQuery(src.slice(last));
+}
+
+function fragmentLooksBooleanQuery(frag: string): boolean {
+  if (/\|/.test(frag) || /\bOR\b/i.test(frag) || /\bAND\b/i.test(frag)) {
+    return true;
+  }
+  const re = /\(([^()]*)\)/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(frag)) !== null) {
+    const inner = m[1];
+    if (/\|/.test(inner) || /\bOR\b/i.test(inner)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** Text before the first `\bOR\b` outside double quotes (null if none). */
+function firstUnquotedOrSegment(raw: string): string | null {
+  const s = String(raw ?? "").trim();
+  let inQuote = false;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (ch === '"') {
+      inQuote = !inQuote;
+      continue;
+    }
+    if (inQuote) {
+      continue;
+    }
+    const tail = s.slice(i);
+    if (/^\bOR\b/i.test(tail)) {
+      return s.slice(0, i).trim();
+    }
+  }
+  return null;
+}
+
+function normalizeTier1Token(s: string): string {
+  let o = s
+    .replace(/[()|&]/g, " ")
+    .replace(/\bOR\b/gi, " ")
+    .replace(/\bAND\b/gi, " ")
+    .trim();
+  o = o.replace(/([A-Za-z0-9])-(?=[A-Za-z0-9])/g, "$1 ");
+  o = o.replace(/\s+/g, " ").trim();
+  return o;
+}
+
+/**
+ * Strip quotes / boolean punctuation for **core word** extraction only — always keeps **all**
+ * tokens (no alternation-first shortcut). Used with `buildCoreWords` so `twc`/`fwc`
+ * see every term (e.g. `Ubuntu` and `Debian`) while phrase tiers can still use {@link buildCleanPhrase}.
+ */
+function buildCleanPhrasePlainNoBoolean(raw: string): string {
+  let s = String(raw ?? "")
+    .replace(/"([^"]*)"/g, "$1")
+    .replace(/[()|&]/g, " ")
+    .replace(/\bOR\b/gi, " ")
+    .replace(/\bAND\b/gi, " ")
+    .trim();
+  s = s.replace(/([A-Za-z0-9])-(?=[A-Za-z0-9])/g, "$1 ");
+  s = s.replace(/\s+/g, " ").trim();
+  return s;
+}
+
+/**
+ * Phrase text for Tier 1 `strpos`: strip manual `"..."` (keep inner text), then boolean punctuation;
+ * turn **internal** `alnum-alnum` hyphens into spaces so titles like `64 bit` match a `64-bit` query.
+ *
+ * For boolean-style queries (`|`, `OR`, `AND`, or parenthesized alternation), Tier 1 substring
+ * match on the full collapsed phrase is unreliable — we return a **single** seed term (first branch
+ * or text before ` OR `) or `""` so SQL binds a non-matching placeholder and Tier 2+/PGroonga rank.
+ */
+function buildCleanPhrase(raw: string): string {
+  if (rawKeywordHasBooleanSyntaxOutsideQuotes(raw)) {
+    const sParen = String(raw ?? "").trim();
+    const reParen = /\(([^()]*)\)/g;
+    let mParen: RegExpExecArray | null;
+    let altFirst: string | null = null;
+    while ((mParen = reParen.exec(sParen)) !== null) {
+      const inner = mParen[1].trim();
+      if (!/\|/.test(inner) && !/\bOR\b/i.test(inner)) {
+        continue;
+      }
+      const firstBranch = inner.includes("|")
+        ? inner.split("|")[0]
+        : inner.split(/\bOR\b/i)[0];
+      const first = String(firstBranch ?? "")
+        .trim()
+        .replace(/^["']+|["']+$/g, "");
+      if (first.length >= 2) {
+        altFirst = first;
+        break;
+      }
+    }
+    if (altFirst != null) {
+      let s = altFirst.replace(/([A-Za-z0-9])-(?=[A-Za-z0-9])/g, "$1 ");
+      s = s.replace(/\s+/g, " ").trim();
+      return s;
+    }
+
+    const orHead = firstUnquotedOrSegment(raw);
+    if (orHead != null && orHead.length > 0) {
+      const norm = normalizeTier1Token(orHead);
+      const firstTok = norm.split(/\s+/).find((w) => w.length >= 2) ?? "";
+      if (firstTok.length >= 2) {
+        return firstTok;
+      }
+    }
+
+    const bare = String(raw ?? "").trim();
+    if (!/"[^"]*"/.test(bare) && /\|/.test(bare)) {
+      const head = bare.split("|")[0]?.trim() ?? "";
+      const stripped = normalizeTier1Token(head);
+      if (stripped.length >= 2) {
+        const firstTok = stripped.split(/\s+/).find((w) => w.length >= 2) ?? stripped;
+        return firstTok.length >= 2 ? firstTok : "";
+      }
+    }
+
+    return "";
+  }
+
+  return buildCleanPhrasePlainNoBoolean(raw);
+}
+
+/** Split `cleanPhrase` tokens; hyphenated tokens expand to full token + each segment (e.g. `64-bit` → `64`, `bit`, `64-bit`). */
+function expandHyphenatedCoreTerms(token: string): string[] {
+  const t = token.trim();
+  if (t.length === 0) {
+    return [];
+  }
+  if (/^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)+$/.test(t)) {
+    const parts = t.split("-");
+    const acc: string[] = [t];
+    for (const p of parts) {
+      if (p.length >= 2 || /^\d+$/.test(p)) {
+        acc.push(p);
+      }
+    }
+    return Array.from(new Set(acc));
+  }
+  return t.length >= 2 ? [t] : [];
+}
+
+function buildCoreWords(cleanPhrase: string): string[] {
+  if (!cleanPhrase) {
+    return [];
+  }
+  const rawTokens = cleanPhrase
+    .split(/\s+/)
+    .map((w) => w.trim())
+    .filter(Boolean);
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const tok of rawTokens) {
+    for (const w of expandHyphenatedCoreTerms(tok)) {
+      const k = w.toLowerCase();
+      if (!seen.has(k)) {
+        seen.add(k);
+        out.push(w);
+      }
+    }
+  }
+  return out;
+}
+
 /**
  * Main torrent search resolver — discovery-only vs PGroonga keyword pipeline.
  *
- * Keyword mode composes `groonga_hits` (title and/or sidecar `search_text`), applies Gold/Silver/Bronze
- * scoring, buffers candidates, then paginates `filtered`. See `groongaHitsBody` for the tier math.
+ * Keyword mode: `pgQuery` + scope-aware `groonga_hits`, tiered `scoring_buffer`, then `ranked_page` /
+ * `boosted_data` (deferred `sw`/`ct_bm`) / `filtered` for `search_rank`.
  */
 export async function search(_: any, { queryInput }: any) {
   try {
     console.info("-".repeat(50));
     console.info("search params", queryInput);
 
-    queryInput.keyword = String(queryInput.keyword ?? "").trim();
+    const rawKeyword = String(queryInput.keyword ?? "").trim();
+
+    // 1. Strict boolean (WHERE / @@): expand first `(…|…)` group to disjunctive form; else `|` → OR.
+    let keywordForSql = rawKeyword;
+    const groupMatch = keywordForSql.match(/(.*?)\(([^)]+)\)(.*)/);
+
+    if (groupMatch) {
+      const before = groupMatch[1].trim();
+      const options = groupMatch[2].split("|").map((s) => s.trim());
+      const after = groupMatch[3].trim();
+
+      keywordForSql = options
+        .map((opt) => `${before} ${opt} ${after}`.trim())
+        .filter(Boolean)
+        .join(" OR ");
+    } else {
+      keywordForSql = keywordForSql.replace(/\|/g, " OR ");
+    }
+
+    // 2. Literal for exact-match boost: strip ()" ; pipes → spaces; collapse whitespace.
+    const keywordLiteral = rawKeyword
+      .replace(/[()"]/g, "")
+      .replace(/\|/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
 
     const emptyKeywords = {
       __typename: "SearchResult" as const,
@@ -612,29 +803,29 @@ export async function search(_: any, { queryInput }: any) {
     };
 
     const discoveryMode =
-      queryInput.keyword.length < 2 &&
+      rawKeyword.length < 2 &&
       hasActiveDiscoveryFiltersFromQueryInput(queryInput);
 
-    if (queryInput.keyword.length < 2 && !discoveryMode) {
+    if (rawKeyword.length < 2 && !discoveryMode) {
       return emptyKeywords;
     }
 
     const REGEX_HASH = /^[a-f0-9]{40}$/;
 
-    if (queryInput.keyword.length === 40 && REGEX_HASH.test(queryInput.keyword)) {
-      const torrent = await torrentByHash(_, { hash: queryInput.keyword });
+    if (rawKeyword.length === 40 && REGEX_HASH.test(rawKeyword)) {
+      const torrent = await torrentByHash(_, { hash: rawKeyword });
 
       if (torrent) {
         return {
           __typename: "SearchResult" as const,
-          keywords: [queryInput.keyword],
+          keywords: [rawKeyword],
           torrents: [torrent],
           total_count: 1,
           has_more: false,
         };
       }
 
-      return { ...emptyKeywords, keywords: [queryInput.keyword] };
+      return { ...emptyKeywords, keywords: [rawKeyword] };
     }
 
     let sortType = String(queryInput.sortType ?? "bestMatch");
@@ -647,7 +838,7 @@ export async function search(_: any, { queryInput }: any) {
     const effectiveSortType =
       discoveryMode && sortType === "bestMatch" ? "date" : sortType;
     const useBestMatchRank =
-      effectiveSortType === "bestMatch" && queryInput.keyword.length >= 2;
+      effectiveSortType === "bestMatch" && rawKeyword.length >= 2;
 
     const filterTime = queryInput.filterTime ?? "all";
     const filterSize = queryInput.filterSize ?? "all";
@@ -677,15 +868,7 @@ export async function search(_: any, { queryInput }: any) {
     let keywordsPlain: string[] = [];
 
     if (!discoveryMode) {
-      const extracted = extractKeywords(queryInput.keyword);
-      const fullStr = queryInput.keyword.replace(/"/g, "").trim();
-      const fuzzyKeywordRows = extracted.filter(
-        ({ keyword: k }) => k.trim().length >= 2,
-      );
-      if (fuzzyKeywordRows.length === 0) {
-        return { ...emptyKeywords, keywords: [queryInput.keyword] };
-      }
-      keywordsPlain = buildSearchHighlightKeywords(queryInput.keyword);
+      keywordsPlain = buildSearchHighlightKeywords(rawKeyword);
     }
 
     const whereTailSql = buildWhereTail(
@@ -709,14 +892,17 @@ export async function search(_: any, { queryInput }: any) {
 
     let searchRankSelect: string;
     let rankJoinAndFromSql: string;
-    /** Monolith PGroonga pipeline `WITH` (includes `filtered`). */
+    /** Monolith keyword FTS pipeline `WITH` (includes `filtered`). */
     let bothEventHorizonWithClause = "";
     /** `COUNT(*)` for keyword search (no buffer/limit params). */
     let monolithCountSql = "";
     /**
-     * `sqlParams.length` after `base` filters + PGroonga `&@~` (`keywordPh`), before buffer / page LIMIT.
+     * `sqlParams.length` after `base` filters + **`pgQuery`** only (`groonga_hits` / count).
+     * `literalPh`, `cleanPhrasePh`, `coreWordsPh` are bound later for `scoring_buffer` / `boosted_data` only.
      */
     let matchedHashesSqlParamCount: number | undefined;
+    /** Keyword monolith: use `search_rank` in final `ORDER BY` when sort is best-match (matches `ranked_page` tie-break intent). */
+    let monolithOuterUsesSearchRank = false;
     /**
      * `sqlParams.length` after discovery inner `FROM`, before LIMIT/OFFSET on `filtered`.
      */
@@ -733,99 +919,257 @@ FROM (
 ) t`;
       searchInnerSqlParamCount = sqlParams.length;
     } else {
-      // Raw string for PGroonga `&@~` (Query Syntax: `*`, OR, `-`, etc.). No extra outer quotes — bound as a single text param.
-      // Pipe is not boolean OR in PGroonga Query Syntax; normalize so alternation behaves as users expect from SQL tradition.
-      const groongaQuery = queryInput.keyword.trim().replace(/\|/g, " OR ");
-      const keywordPh = p(groongaQuery, "text");
+      // BOOLEAN BYPASS: If the user is doing an OR/AND search, we disable the Exact/Fuzzy Phrase tiers.
+      // This allows the query to fall through to the Word Count (Tier 3) where 'minRequiredWords'
+      // handles the logical intersection correctly.
+      const isBooleanQuery =
+        /\||\bOR\b|\bAND\b|\(|\)/i.test(rawKeyword);
+      const pgQuery = buildPgQueryFromExpanded(rawKeyword);
+      const cleanPhrase = buildCleanPhrase(rawKeyword);
+      const cleanPhrasePlainForCore = buildCleanPhrasePlainNoBoolean(rawKeyword);
+      const coreWords = buildCoreWords(cleanPhrasePlainForCore);
+      const orCount =
+        (rawKeyword.match(/\bOR\b/gi) ?? []).length +
+        (rawKeyword.match(/\|/g) ?? []).length;
+      const minRequiredWords = Math.max(1, coreWords.length - orCount);
 
+      const pgQueryPh = p(pgQuery.length > 0 ? pgQuery : " ", "text");
       matchedHashesSqlParamCount = sqlParams.length;
+      const literalPh = p(keywordLiteral, "text");
+      const activePhrase = isBooleanQuery ? "" : cleanPhrase;
+      const cleanPhrasePh = p(activePhrase.length >= 2 ? activePhrase : " ", "text");
+      const fuzzyIlikeString =
+        activePhrase.trim().length > 0
+          ? `%${activePhrase.trim().split(/\s+/).join("% ")}%`
+          : "";
+      const fuzzyIlikePh = p(fuzzyIlikeString, "text");
+      const coreWordsPh = p(coreWords, "text[]");
 
-      /** Cap rows entering `filtered` heavy math (PGroonga + laterals). */
-      const bufferSize = Math.min(limitVal + offsetVal + 400, 410);
-      const bufferPh = p(Math.max(1, bufferSize), "int");
+      const pgTitleCond = `(t.name &@~ ${pgQueryPh})`;
+      const pgSidecarCond = `(tsi.search_text &@~ ${pgQueryPh})`;
 
       const monolithUsesBestMatchRank = effectiveSortType === "bestMatch";
+      monolithOuterUsesSearchRank = monolithUsesBestMatchRank;
 
       /**
-       * `t.created_at` is `timestamptz`: use `NOW() - t.created_at` interval and `EXTRACT(EPOCH FROM …)`.
-       * LN argument is parenthesized so `/ 86400 + 2` stays inside LN (not `LN(ABS) / 86400`).
+       * `search_rank` is computed in `filtered` from `boosted_data` (never self-reference `filtered`).
        */
-      const searchRankExpr = monolithUsesBestMatchRank
-        ? `((tc.base_match_score::double precision * (1.0::double precision + (1.0::double precision / LN((ABS(EXTRACT(EPOCH FROM (NOW() - t.created_at)))::double precision / 86400.0 + 2.0::double precision)))) * (CASE WHEN ct_bm.content_type IN ('movie', 'tv_show') THEN 1.2::double precision ELSE 1.0::double precision END)) + (0.1::double precision * LN(GREATEST(t.max_seeders, 0)::double precision + (GREATEST((SELECT COALESCE(MAX(tts.leechers), 0) FROM torrents_torrent_sources tts WHERE tts.info_hash = t.info_hash), 0)::double precision * 0.5::double precision) + 1.0::double precision)))`
+      const searchRankFromBoostedExpr = monolithUsesBestMatchRank
+        ? `((bd.boosted_base_score::double precision * (1.0::double precision + (1.0::double precision / LN((ABS(EXTRACT(EPOCH FROM (NOW() - bd.created_at)))::double precision / 86400.0 + 2.0::double precision)))) * (CASE WHEN bd.bm_content_type IN ('movie', 'tv_show') THEN 1.2::double precision ELSE 1.0::double precision END)) + (0.1::double precision * LN(GREATEST(COALESCE(bd.swarm_seeders, 0), 0)::double precision + (GREATEST(COALESCE(bd.swarm_leechers, 0), 0)::double precision * 0.5::double precision) + 1.0::double precision)))`
         : `0::double precision`;
 
-      const monolithFilteredOrderBy = monolithUsesBestMatchRank
-        ? `ORDER BY search_rank DESC NULLS LAST, t.size DESC`
+      const rankedPageOrderBy = monolithUsesBestMatchRank
+        ? `ORDER BY tc.base_match_score DESC NULLS LAST, t.max_seeders DESC, t.size DESC`
         : `ORDER BY ${buildOrderBy(effectiveSortType, false, "t")}`;
 
-      const filteredScoringJoinSql = monolithUsesBestMatchRank
+      const boostedDataBmSelect = monolithUsesBestMatchRank
+        ? `ct_bm.content_type::text AS bm_content_type`
+        : `NULL::text AS bm_content_type`;
+
+      const boostedDataScoringJoinSql = monolithUsesBestMatchRank
         ? `LEFT JOIN LATERAL (
     SELECT tc2.content_type::text AS content_type
     FROM torrent_contents tc2
-    WHERE tc2.info_hash = t.info_hash
+    WHERE tc2.info_hash = pr.info_hash
     ORDER BY
-      (SELECT COALESCE(MAX(tts.seeders), -1) FROM torrents_torrent_sources tts WHERE tts.info_hash = t.info_hash) DESC,
+      COALESCE(pr.max_seeders, -1) DESC,
       tc2.updated_at DESC NULLS LAST
     LIMIT 1
   ) ct_bm ON true`
         : "";
 
-      const groongaHitCandidatesSql =
-        searchScope === "title"
-          ? `SELECT info_hash FROM torrents WHERE name &@~ ${keywordPh}`
-          : searchScope === "files"
-            ? `SELECT info_hash FROM torrent_search_indexes WHERE search_text &@~ ${keywordPh}`
-            : `SELECT info_hash FROM (
-    SELECT info_hash FROM torrents WHERE name &@~ ${keywordPh}
-    UNION
-    SELECT info_hash FROM torrent_search_indexes WHERE search_text &@~ ${keywordPh}
-  ) gh_union`;
+      /** `groonga_hits`: scope-filtered `&@~` on `pgQuery` only; same `whereTail` as `base` via `whereTailGroongaSql`. */
+      const whereTailGroongaSql = whereTailSqlTorrentsToAliasT(whereTailSql);
 
-      const filesScoreExpr =
+      const sidecarStrExpr = `LEFT(COALESCE(tsi.search_text::text, ''), ${FTS_SIDECAR_SEARCH_TEXT_MAX_CHARS})`;
+
+      const tier1Title = `(length(trim(${cleanPhrasePh}::text)) >= 2 AND strpos(lower(t.name::text), lower(trim(${cleanPhrasePh}::text))) > 0)`;
+      const tier1TitleFuzzy = `(length(trim(${fuzzyIlikePh}::text)) >= 2 AND t.name::text ILIKE ${fuzzyIlikePh}::text)`;
+      const tier2AnyWordTitle = `(cardinality(${coreWordsPh}::text[]) > 0 AND COALESCE(twc.c, 0::bigint) >= ${minRequiredWords}::bigint)`;
+      const tier3Title = `gh.title_p_score > 0::double precision`;
+      const tier4Files = `length(trim(${cleanPhrasePh}::text)) >= 2 AND strpos(lower(${sidecarStrExpr}), lower(trim(${cleanPhrasePh}::text))) > 0`;
+      const tier4FilesFuzzy = `(length(trim(${fuzzyIlikePh}::text)) >= 2 AND (${sidecarStrExpr})::text ILIKE ${fuzzyIlikePh}::text)`;
+      const tier5AnyWordFiles = `(cardinality(${coreWordsPh}::text[]) > 0 AND COALESCE(fwc.c, 0::bigint) >= ${minRequiredWords}::bigint)`;
+      const tier6Files = `gh.files_p_score > 0::double precision`;
+
+      const wordCountBonusSql = `(COALESCE(twc.c, 0::bigint)::double precision * 100000.0::double precision + COALESCE(fwc.c, 0::bigint)::double precision * 100000.0::double precision)`;
+
+      const scoringBufferWordCountLateralsSql = `
+  LEFT JOIN LATERAL (
+    SELECT COUNT(*)::bigint AS c
+    FROM unnest(${coreWordsPh}::text[]) AS w
+    WHERE length(trim(w::text)) >= 2
+      AND strpos(lower(t.name::text), lower(trim(w::text))) > 0
+  ) twc ON true
+  LEFT JOIN LATERAL (
+    SELECT COUNT(*)::bigint AS c
+    FROM unnest(${coreWordsPh}::text[]) AS w
+    WHERE length(trim(w::text)) >= 2
+      AND strpos(lower(${sidecarStrExpr}), lower(trim(w::text))) > 0
+  ) fwc ON true`;
+
+      const tierScoreCaseTitleSql = `(
+  (
+    CASE
+      WHEN ${tier1Title} THEN 100000000.0::double precision + (gh.title_p_score * 10.0::double precision)
+      WHEN ${tier1TitleFuzzy} THEN 75000000.0::double precision + (gh.title_p_score * 10.0::double precision)
+      WHEN ${tier2AnyWordTitle} THEN 50000000.0::double precision + (gh.title_p_score * 10.0::double precision)
+      WHEN ${tier3Title} THEN 10000000.0::double precision + (gh.title_p_score * 10.0::double precision)
+      ELSE 0.0::double precision
+    END
+  ) + ${wordCountBonusSql}
+)::double precision`;
+
+      const matchTierCaseTitleSql = `(
+  CASE
+    WHEN ${tier1Title} THEN 1
+    WHEN ${tier1TitleFuzzy} THEN 2
+    WHEN ${tier2AnyWordTitle} THEN 3
+    WHEN ${tier3Title} THEN 4
+    ELSE 0
+  END
+)`;
+
+      const tierScoreCaseFilesSql = `(
+  (
+    CASE
+      WHEN ${tier4Files} THEN LEAST(1500000.0::double precision, 1000000.0::double precision + (gh.files_p_score * 10.0::double precision))
+      WHEN ${tier4FilesFuzzy} THEN LEAST(1250000.0::double precision, 750000.0::double precision + (gh.files_p_score * 10.0::double precision))
+      WHEN ${tier5AnyWordFiles} THEN 500000.0::double precision + (gh.files_p_score * 10.0::double precision)
+      WHEN ${tier6Files} THEN 10000.0::double precision + (gh.files_p_score * 10.0::double precision)
+      ELSE 0.0::double precision
+    END
+  ) + ${wordCountBonusSql}
+)::double precision`;
+
+      const matchTierCaseFilesSql = `(
+  CASE
+    WHEN ${tier4Files} THEN 5
+    WHEN ${tier4FilesFuzzy} THEN 6
+    WHEN ${tier5AnyWordFiles} THEN 7
+    WHEN ${tier6Files} THEN 8
+    ELSE 0
+  END
+)`;
+
+      const tierScoreCaseBothSql = `(
+  (
+    CASE
+      WHEN ${tier1Title} THEN 100000000.0::double precision + (gh.title_p_score * 10.0::double precision)
+      WHEN ${tier1TitleFuzzy} THEN 75000000.0::double precision + (gh.title_p_score * 10.0::double precision)
+      WHEN ${tier2AnyWordTitle} THEN 50000000.0::double precision + (gh.title_p_score * 10.0::double precision)
+      WHEN ${tier3Title} THEN 10000000.0::double precision + (gh.title_p_score * 10.0::double precision)
+      WHEN ${tier4Files} THEN LEAST(1500000.0::double precision, 1000000.0::double precision + (gh.files_p_score * 10.0::double precision))
+      WHEN ${tier4FilesFuzzy} THEN LEAST(1250000.0::double precision, 750000.0::double precision + (gh.files_p_score * 10.0::double precision))
+      WHEN ${tier5AnyWordFiles} THEN 500000.0::double precision + (gh.files_p_score * 10.0::double precision)
+      WHEN ${tier6Files} THEN 10000.0::double precision + (gh.files_p_score * 10.0::double precision)
+      ELSE 0.0::double precision
+    END
+  ) + ${wordCountBonusSql}
+)::double precision`;
+
+      const matchTierCaseBothSql = `(
+  CASE
+    WHEN ${tier1Title} THEN 1
+    WHEN ${tier1TitleFuzzy} THEN 2
+    WHEN ${tier2AnyWordTitle} THEN 3
+    WHEN ${tier3Title} THEN 4
+    WHEN ${tier4Files} THEN 5
+    WHEN ${tier4FilesFuzzy} THEN 6
+    WHEN ${tier5AnyWordFiles} THEN 7
+    WHEN ${tier6Files} THEN 8
+    ELSE 0
+  END
+)`;
+
+      let scoringBufferFromJoinSql: string;
+      let tierScoreCaseSql: string;
+      let matchTierCaseSql: string;
+      if (searchScope === "title") {
+        scoringBufferFromJoinSql = `
+  FROM base b
+  INNER JOIN groonga_hits gh ON b.info_hash = gh.info_hash
+  INNER JOIN torrents t ON t.info_hash = b.info_hash
+  LEFT JOIN torrent_search_indexes tsi ON tsi.info_hash = b.info_hash${scoringBufferWordCountLateralsSql}`;
+        tierScoreCaseSql = tierScoreCaseTitleSql;
+        matchTierCaseSql = matchTierCaseTitleSql;
+      } else if (searchScope === "files") {
+        scoringBufferFromJoinSql = `
+  FROM base b
+  INNER JOIN groonga_hits gh ON b.info_hash = gh.info_hash
+  INNER JOIN torrents t ON t.info_hash = b.info_hash
+  INNER JOIN torrent_search_indexes tsi ON tsi.info_hash = b.info_hash${scoringBufferWordCountLateralsSql}`;
+        tierScoreCaseSql = tierScoreCaseFilesSql;
+        matchTierCaseSql = matchTierCaseFilesSql;
+      } else {
+        scoringBufferFromJoinSql = `
+  FROM base b
+  INNER JOIN groonga_hits gh ON b.info_hash = gh.info_hash
+  INNER JOIN torrents t ON t.info_hash = b.info_hash
+  LEFT JOIN torrent_search_indexes tsi ON tsi.info_hash = b.info_hash${scoringBufferWordCountLateralsSql}`;
+        tierScoreCaseSql = tierScoreCaseBothSql;
+        matchTierCaseSql = matchTierCaseBothSql;
+      }
+
+      const groongaHitsInnerSql =
+        searchScope === "title"
+          ? `
+  SELECT
+    t.info_hash,
+    pgroonga_score(t.tableoid, t.ctid)::double precision AS title_p_score,
+    0.0::double precision AS files_p_score
+  FROM torrents t
+  WHERE TRUE
+    ${whereTailGroongaSql}
+    AND ${pgTitleCond}`
+          : searchScope === "files"
+            ? `
+  SELECT
+    t.info_hash,
+    0.0::double precision AS title_p_score,
+    pgroonga_score(tsi.tableoid, tsi.ctid)::double precision AS files_p_score
+  FROM torrent_search_indexes tsi
+  INNER JOIN torrents t ON t.info_hash = tsi.info_hash
+  WHERE TRUE
+    ${whereTailGroongaSql}
+    AND ${pgSidecarCond}`
+            : `
+  SELECT
+    u.info_hash,
+    MAX(u.title_p_score)::double precision AS title_p_score,
+    MAX(u.files_p_score)::double precision AS files_p_score
+  FROM (
+    SELECT
+      t.info_hash,
+      pgroonga_score(t.tableoid, t.ctid)::double precision AS title_p_score,
+      0.0::double precision AS files_p_score
+    FROM torrents t
+    WHERE TRUE
+      ${whereTailGroongaSql}
+      AND ${pgTitleCond}
+    UNION ALL
+    SELECT
+      t.info_hash,
+      0.0::double precision AS title_p_score,
+      pgroonga_score(tsi.tableoid, tsi.ctid)::double precision AS files_p_score
+    FROM torrent_search_indexes tsi
+    INNER JOIN torrents t ON t.info_hash = tsi.info_hash
+    WHERE TRUE
+      ${whereTailGroongaSql}
+      AND ${pgSidecarCond}
+  ) u
+  GROUP BY u.info_hash`;
+
+      const exactFileBoostPr =
         searchScope === "title"
           ? `0.0::double precision`
-          : `COALESCE(fs.score, 0.0)::double precision`;
+          : `(CASE WHEN length(${literalPh}::text) > 0 AND strpos(lower(LEFT(tsi.search_text::text, ${FTS_SIDECAR_SEARCH_TEXT_MAX_CHARS})), lower(${literalPh}::text)) > 0 THEN 25000.0::double precision ELSE 0.0::double precision END)`;
 
-      const filesLateralSql =
+      const filteredTsiJoin =
         searchScope === "title"
           ? ""
-          : `LEFT JOIN LATERAL (
-    SELECT pgroonga_score(tsi.tableoid, tsi.ctid)::double precision AS score
-    FROM torrent_search_indexes tsi
-    WHERE tsi.info_hash = c.info_hash AND tsi.search_text &@~ ${keywordPh}
-    LIMIT 1
-  ) fs ON true`;
-
-      /**
-       * Sidecar `search_text` is one aggregated document per torrent; `pgroonga_score` there
-       * reflects match strength across indexed file paths (not per-file rows).
-       *
-       * **Gold / Silver / Bronze tiering (`base_match_score`):**
-       * - **Gold:** both title PGroonga hit and file-sidecar score → large floor + scaled title + raw files score.
-       * - **Silver:** title-only → mid floor + scaled title (paths did not contribute).
-       * - **Bronze:** files-only / title miss → raw files score only (paths carried the match).
-       * Ordering within `scoring_buffer` then refines by score, seeders, and size before page LIMIT.
-       */
-      const groongaHitsBody = `
-  SELECT
-    c.info_hash,
-    COALESCE(ts.score, 0.0)::double precision AS title_score,
-    ${filesScoreExpr} AS files_score,
-    (CASE
-      WHEN COALESCE(ts.score, 0.0) > 0 AND ${filesScoreExpr} > 0 THEN
-        20000.0::double precision + (COALESCE(ts.score, 0.0) * 100.0) + ${filesScoreExpr}
-      WHEN COALESCE(ts.score, 0.0) > 0 THEN
-        10000.0::double precision + (COALESCE(ts.score, 0.0) * 100.0)
-      ELSE ${filesScoreExpr}
-    END)::double precision AS base_match_score
-  FROM (${groongaHitCandidatesSql}) c
-  LEFT JOIN LATERAL (
-    SELECT pgroonga_score(tn.tableoid, tn.ctid)::double precision AS score
-    FROM torrents tn
-    WHERE tn.info_hash = c.info_hash AND tn.name &@~ ${keywordPh}
-    LIMIT 1
-  ) ts ON true
-  ${filesLateralSql}`;
+          : `
+  LEFT JOIN torrent_search_indexes tsi ON tsi.info_hash = pr.info_hash`;
 
       searchRankSelect = "0::double precision";
       rankJoinAndFromSql = "";
@@ -838,7 +1182,7 @@ WITH base AS (
     ${whereTailSql}
 ),
 groonga_hits AS (
-  ${groongaHitsBody}
+  ${groongaHitsInnerSql}
 )
 SELECT COUNT(*)::bigint AS total
 FROM base b
@@ -853,38 +1197,86 @@ base AS (
     ${whereTailSql}
 ),
 groonga_hits AS (
-  ${groongaHitsBody}
+  ${groongaHitsInnerSql}
 ),
+/* RELEVANCE TIERS (Title beats Files, Exact beats Fuzzy):
+  1. 100M: Exact Phrase Match (strpos)
+  2.  75M: Fuzzy Ordered Phrase (ILIKE '%word1% word2%')
+  3.  50M: All Words Match (minRequiredWords logic via lateral join)
+  4.  10M: PGroonga Partial Hit
+  (Tiers 5-8 mirror this for Files, capped at 1.5M points)
+*/
 scoring_buffer AS (
   SELECT
     b.info_hash,
     b.size,
     b.max_seeders,
-    gh.title_score,
-    gh.files_score,
-    gh.base_match_score
-  FROM base b
-  INNER JOIN groonga_hits gh ON b.info_hash = gh.info_hash
-  ORDER BY gh.base_match_score DESC, b.max_seeders DESC, b.size DESC
-  LIMIT ${bufferPh}
+    gh.title_p_score AS title_score,
+    gh.files_p_score AS files_score,
+    ${tierScoreCaseSql} AS base_match_score,
+    ${matchTierCaseSql} AS match_tier
+  ${scoringBufferFromJoinSql}
 ),
-filtered AS (
+ranked_page AS (
   SELECT
-    t.info_hash,
+    tc.info_hash,
+    tc.base_match_score,
+    tc.size,
+    tc.max_seeders,
     t.name,
-    t.size,
     t.created_at,
     t.updated_at,
     t.files_count,
     t.file_stats,
-    t.is_spam AS potential_spam,
-    ${searchRankExpr} AS search_rank
+    t.is_spam AS potential_spam
   FROM scoring_buffer tc
   INNER JOIN torrents t ON t.info_hash = tc.info_hash
-  ${filteredScoringJoinSql}
-  ${monolithFilteredOrderBy}
+  ${rankedPageOrderBy}
   LIMIT ${p(limitVal, "int")}
   OFFSET ${p(offsetVal, "int")}
+),
+boosted_data AS (
+  SELECT
+    pr.info_hash,
+    pr.name,
+    pr.size,
+    pr.created_at,
+    pr.updated_at,
+    pr.files_count,
+    pr.file_stats,
+    pr.potential_spam,
+    pr.max_seeders,
+    pr.base_match_score,
+    (pr.base_match_score + ${exactFileBoostPr})::double precision AS boosted_base_score,
+    COALESCE(sw.swarm_seeders, 0) AS swarm_seeders,
+    COALESCE(sw.swarm_leechers, 0) AS swarm_leechers,
+    ${boostedDataBmSelect}
+  FROM ranked_page pr
+  ${filteredTsiJoin}
+  LEFT JOIN LATERAL (
+    SELECT
+      MAX(tts.seeders) AS swarm_seeders,
+      MAX(tts.leechers) AS swarm_leechers
+    FROM torrents_torrent_sources tts
+    WHERE tts.info_hash = pr.info_hash
+  ) sw ON true
+  ${boostedDataScoringJoinSql}
+),
+filtered AS (
+  SELECT
+    bd.info_hash,
+    bd.name,
+    bd.size,
+    bd.created_at,
+    bd.updated_at,
+    bd.files_count,
+    bd.file_stats,
+    bd.potential_spam,
+    bd.boosted_base_score AS base_match_score,
+    bd.swarm_seeders,
+    bd.swarm_leechers,
+    ${searchRankFromBoostedExpr} AS search_rank
+  FROM boosted_data bd
 )`;
     }
 
@@ -904,6 +1296,15 @@ SELECT
   filtered.updated_at,
   filtered.files_count,
   filtered.file_stats,
+  json_build_object(
+    'video', COALESCE(tcmp.video_count, 0),
+    'audio', COALESCE(tcmp.audio_count, 0),
+    'image', COALESCE(tcmp.image_count, 0),
+    'document', COALESCE(tcmp.document_count, 0),
+    'archive', COALESCE(tcmp.archive_count, 0),
+    'app', COALESCE(tcmp.app_count, 0),
+    'other', COALESCE(tcmp.other_count, 0)
+  )::text AS composition_counts,
   filtered.potential_spam AS potential_spam,
   ct.content_type,
   COALESCE(alt.titles, '[]'::json) AS alternate_titles,
@@ -932,12 +1333,13 @@ SELECT
   ) AS files_preview
   /* Lodestar: files_preview = first N torrent_files rows (zero-cost accordion); tail via torrentFiles + client IO */
 FROM filtered
+LEFT JOIN torrent_compositions tcmp ON tcmp.info_hash = filtered.info_hash
 LEFT JOIN LATERAL (
   SELECT tc.content_type::text AS content_type
   FROM torrent_contents tc
   WHERE tc.info_hash = filtered.info_hash
   ORDER BY
-    (SELECT COALESCE(MAX(tts.seeders), -1) FROM torrents_torrent_sources tts WHERE tts.info_hash = filtered.info_hash) DESC,
+    COALESCE(filtered.swarm_seeders, -1) DESC,
     tc.updated_at DESC NULLS LAST
   LIMIT 1
 ) ct ON true
@@ -957,7 +1359,7 @@ LEFT JOIN LATERAL (
     AND tc.content_id = c.id
   WHERE tc.info_hash = filtered.info_hash
   ORDER BY
-    (SELECT COALESCE(MAX(tts.seeders), -1) FROM torrents_torrent_sources tts WHERE tts.info_hash = filtered.info_hash) DESC,
+    COALESCE(filtered.swarm_seeders, -1) DESC,
     tc.updated_at DESC NULLS LAST,
     LENGTH(COALESCE(
       NULLIF(trim(both FROM c.title::text), ''),
@@ -1005,7 +1407,7 @@ LEFT JOIN LATERAL (
   ) AS rows
   FROM torrents_torrent_sources s
   WHERE s.info_hash = filtered.info_hash
-) src ON true;
+) src ON true
 `;
 
     /** Snapshot before `LIMIT`/`OFFSET` placeholders on non-monolith main queries. */
@@ -1014,9 +1416,16 @@ LEFT JOIN LATERAL (
         ? sqlParams.slice(0, matchedHashesSqlParamCount)
         : sqlParams.slice(0, searchInnerSqlParamCount ?? sqlParams.length);
 
+    const monolithFinalOrderBy = buildOrderBy(
+      effectiveSortType,
+      monolithOuterUsesSearchRank,
+      "filtered",
+    );
+
     const sql =
       bothEventHorizonWithClause !== ""
-        ? `WITH ${bothEventHorizonWithClause}${outerSelectFromFiltered}`
+        ? `WITH ${bothEventHorizonWithClause}${outerSelectFromFiltered}
+ORDER BY ${monolithFinalOrderBy};`
         : `
 WITH filtered AS (
   SELECT
@@ -1033,7 +1442,7 @@ WITH filtered AS (
   ORDER BY ${orderByClause}
   LIMIT ${p(limitVal, "int")}
   OFFSET ${p(offsetVal, "int")}
-)${outerSelectFromFiltered}`;
+)${outerSelectFromFiltered};`;
 
     const params = sqlParams;
 
@@ -1237,6 +1646,15 @@ SELECT
   t.updated_at,
   t.files_count,
   t.file_stats,
+  json_build_object(
+    'video', COALESCE(tcmp.video_count, 0),
+    'audio', COALESCE(tcmp.audio_count, 0),
+    'image', COALESCE(tcmp.image_count, 0),
+    'document', COALESCE(tcmp.document_count, 0),
+    'archive', COALESCE(tcmp.archive_count, 0),
+    'app', COALESCE(tcmp.app_count, 0),
+    'other', COALESCE(tcmp.other_count, 0)
+  )::text AS composition_counts,
   (
     SELECT COALESCE(
       json_agg(json_build_object(
@@ -1251,6 +1669,7 @@ SELECT
     WHERE f.info_hash = t.info_hash${torrentFilesSqlLimitClause}
   ) AS files
 FROM torrents t
+LEFT JOIN torrent_compositions tcmp ON tcmp.info_hash = t.info_hash
 WHERE t.info_hash = decode($1::text, 'hex');
     `;
 

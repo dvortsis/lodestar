@@ -26,7 +26,7 @@ export type CompositionMetric = "size" | "count";
 
 export type CompositionRule = {
   mode: CompositionMode;
-  /** 0–100, step 5; meaningful when mode is `include` */
+  /** 0–100; meaningful when mode is `include` (threshold uses 1–100 in the UI) */
   percent: number;
   metric: CompositionMetric;
 };
@@ -34,12 +34,12 @@ export type CompositionRule = {
 export const DEFAULT_COMPOSITION_RULE: CompositionRule = {
   mode: "inactive",
   percent: 0,
-  metric: "size",
+  metric: "count",
 };
 
 /**
- * Parses `exclude` | `include` | `include:<percent>:<metric>` where metric is `size` | `count`.
- * Percent is an integer 0–100 (snapped to 5% steps), e.g. `include:30:size` → include, 30, size.
+ * Parses `exclude` | `include` | `include:<percent>[:metric]`. Percent is 0–100 (integer steps).
+ * Serialized params always use file-count metric (`:count`); legacy `:size` in URLs is ignored.
  */
 export function parseCompositionParam(
   raw: string | undefined | null,
@@ -49,16 +49,16 @@ export function parseCompositionParam(
   }
   const s = String(raw).trim().toLowerCase();
   if (s === "exclude") {
-    return { mode: "exclude", percent: 0, metric: "size" };
+    return { mode: "exclude", percent: 0, metric: "count" };
   }
   const m = /^include(?::(\d+))?(?::(size|count))?$/i.exec(s);
   if (m) {
     const pctRaw = m[1] != null ? parseInt(m[1], 10) : 0;
     const pct = Number.isFinite(pctRaw)
-      ? Math.min(100, Math.max(0, Math.round(pctRaw / 5) * 5))
+      ? Math.min(100, Math.max(0, Math.round(pctRaw)))
       : 0;
-    const metric = m[2] === "count" ? "count" : "size";
-    return { mode: "include", percent: pct, metric };
+    // UI and API always use file-count metric; legacy `:size` in URLs is treated as count.
+    return { mode: "include", percent: pct, metric: "count" };
   }
   return DEFAULT_COMPOSITION_RULE;
 }
@@ -73,7 +73,7 @@ export function serializeCompositionRule(rule: CompositionRule): string {
   if (rule.percent <= 0) {
     return "include";
   }
-  return `include:${rule.percent}:${rule.metric}`;
+  return `include:${rule.percent}:count`;
 }
 
 export function isCompositionRuleActive(rule: CompositionRule): boolean {

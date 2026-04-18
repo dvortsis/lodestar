@@ -13,6 +13,7 @@ const query = gql`
       magnet_uri
       single_file
       files_count
+      composition_counts
       files {
         index
         path

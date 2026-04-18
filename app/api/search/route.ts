@@ -42,6 +42,7 @@ const SEARCH = gql`
         single_file
         files_count
         file_stats
+        composition_counts
         files_preview {
           index
           path

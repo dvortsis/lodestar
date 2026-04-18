@@ -42,6 +42,7 @@ const typeDefs = gql`
     single_file: Boolean!
     files_count: Int!
     file_stats: String
+    composition_counts: String
     files_preview: [TorrentFile!]!
     files: [TorrentFile!]!
     created_at: Int!

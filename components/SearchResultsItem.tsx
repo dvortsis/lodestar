@@ -25,8 +25,8 @@ import { useTranslations } from "next-intl";
 
 import { TorrentItemProps } from "@/types";
 import { $env, hexToBase64, formatByteSize, setClipboard, Toast } from "@/utils";
+import { CompositionCountsBar } from "@/components/CompositionCountsBar";
 import { TorrentFileTree } from "@/components/TorrentFileTree";
-import { TorrentFilesBar } from "@/components/TorrentFilesBar";
 import { TimeAgo } from "@/components/TimeAgo";
 import { SEARCH_KEYWORD_SPLIT_REGEX } from "@/config/constant";
 import {
@@ -34,7 +34,6 @@ import {
   isSimplePrefixWildcardToken,
 } from "@/lib/searchUtils";
 import { normalizeFilterTimeField } from "@/lib/searchUrl";
-import { getFileTypeBreakdownFromFileStats } from "@/lib/fileUtils";
 import { useHydration } from "@/hooks/useHydration";
 import { extractVideoResolutions } from "@/lib/videoResolution";
 
@@ -228,21 +227,6 @@ function useSearchResultRowDerived({
       ? "Search.date_line_added"
       : "Search.date_line_discovered";
 
-  const typeBreakdown = useMemo(() => {
-    if (!item.file_stats) {
-      return [];
-    }
-    try {
-      const raw =
-        typeof item.file_stats === "string"
-          ? JSON.parse(item.file_stats)
-          : item.file_stats;
-      return getFileTypeBreakdownFromFileStats(raw);
-    } catch {
-      return [];
-    }
-  }, [item.file_stats]);
-
   const peerStats = useMemo(() => {
     const src = item.sources;
     if (!src?.length) {
@@ -277,7 +261,6 @@ function useSearchResultRowDerived({
     timeLineKey,
     timeUnix,
     titleShown,
-    typeBreakdown,
   };
 }
 
@@ -457,24 +440,19 @@ export function SearchResultAccordionSubtitle(
  */
 export function SearchResultAccordionBody(props: SearchResultAccordionProps) {
   const m = useSearchResultRowDerived(props);
-  const { item, keywords, t, typeBreakdown } = m;
+  const { item, keywords, t } = m;
 
   return (
     <div className="w-full border-t border-default-200/50 bg-content1 px-4 pb-4 pt-3 dark:border-default-100/30">
       {item.files_count > 0 ? (
         <div className="space-y-3">
-          {typeBreakdown.length > 0 && (
-            <TorrentFilesBar
-              breakdown={typeBreakdown}
-              labelFor={(c) => t(`Search.file_cat_${c}`)}
-            />
-          )}
           <TorrentFileTree
             filesCount={item.files_count}
             infoHash={item.hash}
             initialFiles={item.files_preview ?? undefined}
             searchBoostKeywords={keywords}
           />
+          <CompositionCountsBar item={item} />
         </div>
       ) : (
         <p className="text-xs text-default-500">{t("Search.no_files_list")}</p>

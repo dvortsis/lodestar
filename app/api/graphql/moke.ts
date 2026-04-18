@@ -26,6 +26,18 @@ export function search() {
         __typename: "Torrent" as const,
         files: [],
         files_preview,
+        composition_counts:
+          typeof t.composition_counts === "string"
+            ? t.composition_counts
+            : JSON.stringify({
+                video: 2,
+                audio: 1,
+                image: 0,
+                document: 0,
+                archive: 1,
+                app: 0,
+                other: 0,
+              }),
       };
     }),
   };

@@ -49,6 +49,8 @@ export type TorrentItemProps = {
   files_count: number;
   /** JSON string of `torrents.file_stats` (composition rollups from search/detail API) */
   file_stats?: string | null;
+  /** JSON string of per-category file counts from `torrent_compositions` (search/detail) */
+  composition_counts?: string | null;
   /** First 20 files from search SQL (hydrate file tree without waiting for torrentFiles page 0) */
   files_preview?: {
     index: number;
