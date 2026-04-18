@@ -5,8 +5,12 @@
  * Includes fallback logic to identify file types for single-file torrents.
  */
 
-require('dotenv').config({ path: '.env.local' });
-require('dotenv').config();
+try {
+  require('dotenv').config({ path: '.env.local' });
+  require('dotenv').config();
+} catch (e) {
+  // Running in Docker/Unraid, dotenv isn't needed
+}
 
 const { Client } = require('pg');
 
@@ -15,7 +19,7 @@ async function runJanitor() {
 
   const dbUrl = process.env.POSTGRES_DB_URL;
   if (!dbUrl) {
-    console.error("❌ ERROR: POSTGRES_DB_URL is not set in your .env file.");
+    console.error("❌ ERROR: POSTGRES_DB_URL is not set in your environment variables.");
     process.exit(1);
   }
 

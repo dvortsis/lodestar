@@ -28,6 +28,9 @@ COPY --from=builder /app/.next/standalone ./
 COPY --from=builder /app/.next/static ./.next/static
 COPY --from=builder /app/.next/server ./.next/server
 
+# NEW: Copy node_modules so the janitor script has access to 'pg' (Postgres driver)
+COPY --from=deps /app/node_modules ./node_modules
+
 # Copy the custom scripts directory so janitor.js is baked into the final image
 COPY --from=builder /app/scripts ./scripts
 
