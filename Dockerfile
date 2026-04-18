@@ -28,6 +28,9 @@ COPY --from=builder /app/.next/standalone ./
 COPY --from=builder /app/.next/static ./.next/static
 COPY --from=builder /app/.next/server ./.next/server
 
+# Copy the custom scripts directory so janitor.js is baked into the final image
+COPY --from=builder /app/scripts ./scripts
+
 # Expose the application port
 EXPOSE 3000
 
