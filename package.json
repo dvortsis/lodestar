@@ -67,5 +67,6 @@
 		"eslint-plugin-react-hooks": "^4.6.0",
 		"eslint-plugin-unused-imports": "^3.2.0",
 		"typescript": "5.4.5"
-	}
+	},
+	"version": "0.9.1"
 }
